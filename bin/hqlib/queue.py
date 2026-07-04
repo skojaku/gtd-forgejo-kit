@@ -1,16 +1,26 @@
-"""hq queue — event detection and the job queue between aster and the Mac.
+"""hq queue — event detection and the job queue between the master and workers.
 
 Roles (config: queue.* in env.yaml):
-- aster (always-on entry point): `hq queue scan` on a systemd timer detects
-  new unread mail and new issue activity and writes job files; small-model
-  triage jobs are processed locally with `hq queue work --types triage`.
-- Mac (the heavy LLM): `hq queue work --types collect,full-sweep --remote aster`
-  claims jobs over ssh and runs them against the local mtplx server.
+- master (always-on entry point): `hq queue scan` (cron) detects new issue
+  activity plus whatever event sources each plugin's `scan()` hook adds
+  (e.g. the mail plugin's new-unread-mail detection), and writes job files;
+  small-model triage jobs are processed locally with `hq queue work --types
+  triage`.
+- workers (heavier local models): `hq queue work --types collect --remote
+  <master-ssh-alias>` claims jobs over ssh and runs them against their own
+  local model.
 
 Jobs are JSON files under queue/pending|processing|done|failed. Retries are
 encoded in the filename (….r0.json → ….r1.json) so remote claiming never has
 to rewrite file contents. Everything here is deterministic — the LLM only
 runs inside `work`, via pi, with a per-type prompt template.
+
+Job types: "collect" is handled here directly (run_collect_job, core — it's
+Forgejo-native, not source-specific). Any other type is offered to each
+plugin's optional `handle_job()` hook first (e.g. the mail plugin owns
+"thread_update"); if no plugin claims it, it falls through to the generic
+prompt-driven `run_job_llm` (this is how "triage" is processed — no
+plugin-specific code needed for a job type that's just "run this prompt").
 """
 import json
 import os
@@ -22,7 +32,8 @@ import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .common import fail, run, run_json, load_config, repo, owner, repo_root, print_json
+from .common import fail, load_config, owner, repo_name, forgejo_url, repo_root, print_json
+from .forgejo import ForgejoClient
 
 MAX_RETRIES = 3
 SEEN_IDS_CAP = 500
@@ -108,119 +119,41 @@ def enqueue(qdir, job_type, target, payload):
 
 
 # --------------------------------------------------------------------------
-# Email-thread tracking — link a Gmail thread to the issue triage created, so
-# later replies/forwards on that thread log onto the issue and refresh its
-# dossier instead of spawning a duplicate card.
+# Thread tracking — link a producer's own reference (e.g. a Gmail thread id,
+# via the mail plugin's `<!-- email-thread:... -->` marker) to the issue its
+# triage created, so a later event on that thread logs onto the issue and
+# refreshes its dossier instead of spawning a duplicate card. The marker
+# format itself is a plugin convention (currently only the mail plugin
+# writes one); core just knows the one regex, not any plugin's code.
 # --------------------------------------------------------------------------
 
-# Embedded in the issue body by the triage prompt: <!-- email-thread:<threadId> -->
 _EMAIL_THREAD_RE = re.compile(r"<!--\s*email-thread:([A-Za-z0-9_-]+)\s*-->")
 
 
-def _gws_json(cmd, env):
-    """Run a gws command and parse JSON, tolerating the 'Using keyring
-    backend: ...' status line gws prints before JSON on the raw API verbs."""
-    out = run(cmd, env=env)
-    for i, ch in enumerate(out):
-        if ch in "{[":
-            return json.loads(out[i:])
-    fail(f"`{' '.join(cmd)}` returned no JSON: {out[:300]}")
-
-
-def _list_unread_threads(cfg):
-    """[{'id','threadId'}] for recent unread mail. The raw messages.list API
-    carries threadId (the +triage helper strips it), so one call links every
-    unread message to the thread it belongs to."""
-    from .mail import resolve_account, gws_env
-    _, config_dir, _ = resolve_account(cfg, None)
-    params = json.dumps({"userId": "me", "q": "is:unread newer_than:2d", "maxResults": 25})
-    data = _gws_json(
-        ["gws", "gmail", "users", "messages", "list", "--params", params, "--format", "json"],
-        env=gws_env(config_dir),
-    )
-    return [
-        {"id": m.get("id"), "threadId": m.get("threadId")}
-        for m in (data.get("messages") or []) if m.get("id")
-    ]
-
-
-def _message_meta(cfg, mid):
-    """{'from','subject','date','snippet','url'} for one message — used to log a
-    thread evolution onto the issue."""
-    from .mail import resolve_account, gws_env, mail_url
-    _, config_dir, url_index = resolve_account(cfg, None)
-    params = json.dumps({"userId": "me", "id": mid, "format": "metadata",
-                         "metadataHeaders": ["From", "Subject", "Date"]})
-    data = _gws_json(
-        ["gws", "gmail", "users", "messages", "get", "--params", params, "--format", "json"],
-        env=gws_env(config_dir),
-    )
-    headers = {h.get("name", "").lower(): h.get("value", "")
-               for h in (data.get("payload") or {}).get("headers", [])}
-    return {
-        "from": headers.get("from", "unknown"),
-        "subject": headers.get("subject", "(no subject)"),
-        "date": headers.get("date", ""),
-        "snippet": (data.get("snippet") or "").strip(),
-        "url": mail_url(url_index, mid),
-    }
+def _client(cfg):
+    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
 
 
 # --------------------------------------------------------------------------
-# scan — deterministic event detection (runs on aster)
+# scan — deterministic event detection (runs on the master)
 # --------------------------------------------------------------------------
-
-def scan_mail(cfg, state, qdir, taken):
-    msgs = _list_unread_threads(cfg)
-    seen = set(state.get("seen_message_ids", []))
-    new = [m for m in msgs if m["id"] not in seen]
-    if not new:
-        return []
-    thread_map = state.get("email_threads", {})
-    ids = state.setdefault("seen_message_ids", [])
-    # One job per message: a single read-classify-act decision per LLM
-    # invocation is the granularity small models handle reliably.
-    created = []
-    for m in new[:10]:
-        mid, tid = m["id"], m.get("threadId")
-        ids.append(mid)
-        issue = thread_map.get(tid) if tid else None
-        if issue:
-            # This thread already has an issue → the new message is a
-            # reply/forward that evolved it. Log + refresh, don't re-triage.
-            if ("thread_update", mid) not in taken:
-                created.append(enqueue(qdir, "thread_update", mid,
-                                       {"issue": issue, "message_id": mid, "thread_id": tid}))
-                taken.add(("thread_update", mid))
-        elif ("triage", mid) not in taken:
-            created.append(enqueue(qdir, "triage", mid, {"message_id": mid, "thread_id": tid}))
-            taken.add(("triage", mid))
-    # Bound the seen list so state.json can't grow without limit.
-    if len(ids) > 2000:
-        state["seen_message_ids"] = ids[-2000:]
-    return created
-
 
 def scan_issues(cfg, state, qdir, taken):
     from .dossier import MARKER_PREFIX
-    r = repo(cfg)
+    client = _client(cfg)
     user_login = owner(cfg)
     since = state.get("last_issue_scan")
     scan_started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    params = "state=open&per_page=50" + (f"&since={since}" if since else "")
-    issues = run_json(["gh", "api", f"repos/{r}/issues?{params}"])
-    if isinstance(issues, dict):
-        issues = [issues]
+    issues = client.list_issues(state="open", since=since)
 
     created = []
     for issue in issues:
-        if issue.get("pull_request"):
-            continue
         n = issue["number"]
-        # Learn the Gmail thread ↔ issue link from the marker triage embedded in
-        # the body, so scan_mail can route future replies here. Free — this scan
-        # already fetched the body. Drop the mapping if the issue has closed.
+        # Learn a producer's thread ↔ issue link from the marker embedded in
+        # the body (see module docstring above), so that producer's own scan
+        # can route future events here. Free — this scan already fetched the
+        # body. Drop the mapping if the issue has closed.
         mt = _EMAIL_THREAD_RE.search(issue.get("body") or "")
         if mt:
             tmap = state.setdefault("email_threads", {})
@@ -234,12 +167,7 @@ def scan_issues(cfg, state, qdir, taken):
         if since is None or issue.get("created_at", "") > since:
             needs_collect = True
         else:
-            comments = run_json([
-                "gh", "api",
-                f"repos/{r}/issues/{n}/comments?since={since}&per_page=20",
-            ])
-            if isinstance(comments, dict):
-                comments = [comments]
+            comments = client.list_comments(n)
             for c in comments:
                 body = c.get("body") or ""
                 if body.startswith(MARKER_PREFIX):
@@ -261,9 +189,14 @@ def cmd_scan(args):
     state = load_state(cfg)
     taken = existing_targets(qdir)
 
+    from . import plugins
+
     created = []
-    created += scan_mail(cfg, state, qdir, taken)
     created += scan_issues(cfg, state, qdir, taken)
+    for plugin in plugins.discover():
+        plugin_scan = getattr(plugin, "scan", None)
+        if plugin_scan:
+            created += plugin_scan(cfg, state, qdir, taken) or []
 
     # Daily backstop: refresh dossiers on active tasks. Expanded here into
     # per-issue collect jobs — one issue per LLM invocation, no batch job.
@@ -468,33 +401,19 @@ def run_collect_job(cfg, issue, log, job_name, force=False):
     return True, None
 
 
-def run_thread_update(cfg, payload, log, job_name):
-    """Log a Gmail thread evolution (reply/forward) onto the linked issue and
-    queue a forced dossier refresh. Deterministic — no LLM, cheap enough to run
-    on aster in the triage tick."""
-    issue = payload.get("issue")
-    mid = payload.get("message_id")
-    if not issue or not mid:
-        return False, "thread_update missing issue/message_id"
-    r = repo(cfg)
-    issue_data = run_json(["gh", "api", f"repos/{r}/issues/{issue}"])
-    if (issue_data.get("state") or "").lower() == "closed":
-        log.append({"job": job_name, "note": f"issue #{issue} closed — thread update skipped"})
-        return True, None
-    meta = _message_meta(cfg, mid)
-    body = (
-        f"📩 **Email thread update** — {meta['from']}"
-        + (f" · {meta['date']}" if meta["date"] else "")
-        + f"\n\n> {meta['subject']}\n\n{meta['snippet']}\n\n[Open in Gmail]({meta['url']})"
-    )
-    run(["gh", "issue", "comment", str(issue), "--repo", r, "--body", body])
-    # Refresh the dossier so it reflects the evolved thread. force=True because a
-    # new email is not a "user comment", so is_fresh() would otherwise skip it.
-    qdir = queue_dir(cfg)
-    if ("collect", str(issue)) not in existing_targets(qdir):
-        enqueue(qdir, "collect", str(issue), {"issue": issue, "force": True})
-    log.append({"job": job_name, "issue": issue, "logged": meta["subject"]})
-    return True, None
+def _dispatch_to_plugin(job_type, cfg, payload, log, job_name):
+    """Ask every plugin's handle_job() in turn whether it owns this job_type.
+    Returns (ok, err) from the first plugin that claims it, or None if none
+    do (falls through to the generic prompt-driven LLM runner)."""
+    from . import plugins
+    for plugin in plugins.discover():
+        handler = getattr(plugin, "handle_job", None)
+        if not handler:
+            continue
+        result = handler(job_type, cfg, payload, log, job_name)
+        if result is not None:
+            return result
+    return None
 
 
 def cmd_work(args):
@@ -517,10 +436,12 @@ def cmd_work(args):
         if job_type == "collect":
             ok, err = run_collect_job(cfg, payload.get("issue") or int(target), log,
                                       job_name=name, force=payload.get("force", False))
-        elif job_type == "thread_update":
-            ok, err = run_thread_update(cfg, payload, log, job_name=name)
         else:
-            ok, err = run_job_llm(cfg, job_type, payload, log, job_name=name)
+            result = _dispatch_to_plugin(job_type, cfg, payload, log, name)
+            if result is not None:
+                ok, err = result
+            else:
+                ok, err = run_job_llm(cfg, job_type, payload, log, job_name=name)
         outcome = q.finish(name, ok)
         processed.append({"job": name, "type": job_type, "target": target,
                           "outcome": outcome, **({"error": err} if err else {})})

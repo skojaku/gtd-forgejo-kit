@@ -5,46 +5,153 @@ created as drafts. The never-send boundary is enforced here, not by prompts.
 
 Search results carry a clickable `url` built from the account's
 `mail_url_index` config so the model never constructs Gmail links.
+
+Also the queue's mail event-detection plugin: `scan()` finds new unread mail
+(called by `hq queue scan`), `handle_job()` processes "thread_update" jobs
+(a reply/forward on a thread already linked to an issue — logs it and forces
+a dossier refresh). Both hooks are optional parts of the plugin contract,
+see hqlib/plugins/__init__.py.
 """
 import json
 import os
 from pathlib import Path
 
-from .common import fail, run, run_json, load_config, excerpt, envelope, print_json
+from ...common import (
+    fail, run, run_json, load_config, excerpt, envelope, print_json,
+    resolve_account, gws_env, owner, repo_name, forgejo_url,
+)
+from ...forgejo import ForgejoClient
 
-
-def resolve_account(cfg, name):
-    """Returns (account_key, config_dir_or_None, mail_url_index).
-
-    Account values are either a bare config-dir string (legacy) or a mapping
-    {config_dir, mail_url_index}. An empty config_dir means "use gws's own
-    default" (single-account host).
-    """
-    gt = cfg.get("gmail_triage") or {}
-    accounts = gt.get("accounts", {})
-    key = name or gt.get("default_account")
-    if not key or key not in accounts:
-        fail(f"unknown account '{key}'. Known accounts: {sorted(accounts)}")
-    raw = accounts[key]
-    if isinstance(raw, dict):
-        path = raw.get("config_dir") or ""
-        url_index = raw.get("mail_url_index", 0)
-    else:
-        path = raw or ""
-        url_index = 0
-    config_dir = str(Path(path).expanduser()) if path else None
-    return key, config_dir, url_index
-
-
-def gws_env(config_dir):
-    env = os.environ.copy()
-    if config_dir:
-        env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = config_dir
-    return env
+NAME = "mail"
 
 
 def mail_url(url_index, message_id):
     return f"https://mail.google.com/mail/u/{url_index}/#all/{message_id}"
+
+
+def _client(cfg):
+    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
+
+
+def _gws_json(cmd, env):
+    """Run a gws command and parse JSON, tolerating the 'Using keyring
+    backend: ...' status line gws prints before JSON on the raw API verbs."""
+    out = run(cmd, env=env)
+    for i, ch in enumerate(out):
+        if ch in "{[":
+            return json.loads(out[i:])
+    fail(f"`{' '.join(cmd)}` returned no JSON: {out[:300]}")
+
+
+def _list_unread_threads(cfg):
+    """[{'id','threadId'}] for recent unread mail. The raw messages.list API
+    carries threadId (the +triage helper strips it), so one call links every
+    unread message to the thread it belongs to."""
+    _, config_dir, _ = resolve_account(cfg, None)
+    params = json.dumps({"userId": "me", "q": "is:unread newer_than:2d", "maxResults": 25})
+    data = _gws_json(
+        ["gws", "gmail", "users", "messages", "list", "--params", params, "--format", "json"],
+        env=gws_env(config_dir),
+    )
+    return [
+        {"id": m.get("id"), "threadId": m.get("threadId")}
+        for m in (data.get("messages") or []) if m.get("id")
+    ]
+
+
+def _message_meta(cfg, mid):
+    """{'from','subject','date','snippet','url'} for one message — used to log a
+    thread evolution onto the issue."""
+    _, config_dir, url_index = resolve_account(cfg, None)
+    params = json.dumps({"userId": "me", "id": mid, "format": "metadata",
+                         "metadataHeaders": ["From", "Subject", "Date"]})
+    data = _gws_json(
+        ["gws", "gmail", "users", "messages", "get", "--params", params, "--format", "json"],
+        env=gws_env(config_dir),
+    )
+    headers = {h.get("name", "").lower(): h.get("value", "")
+               for h in (data.get("payload") or {}).get("headers", [])}
+    return {
+        "from": headers.get("from", "unknown"),
+        "subject": headers.get("subject", "(no subject)"),
+        "date": headers.get("date", ""),
+        "snippet": (data.get("snippet") or "").strip(),
+        "url": mail_url(url_index, mid),
+    }
+
+
+# --------------------------------------------------------------------------
+# Queue plugin hooks — scan() / handle_job(), see hqlib/plugins/__init__.py
+# --------------------------------------------------------------------------
+
+def scan(cfg, state, qdir, taken):
+    """New-unread-mail event detection. `enqueue`/`taken` come from core's
+    queue.py — imported lazily to avoid a load-order cycle (queue.py imports
+    this package to call scan(); this package needs queue.py's enqueue())."""
+    from ...queue import enqueue
+
+    msgs = _list_unread_threads(cfg)
+    seen = set(state.get("seen_message_ids", []))
+    new = [m for m in msgs if m["id"] not in seen]
+    if not new:
+        return []
+    thread_map = state.get("email_threads", {})
+    ids = state.setdefault("seen_message_ids", [])
+    # One job per message: a single read-classify-act decision per LLM
+    # invocation is the granularity small models handle reliably.
+    created = []
+    for m in new[:10]:
+        mid, tid = m["id"], m.get("threadId")
+        ids.append(mid)
+        issue = thread_map.get(tid) if tid else None
+        if issue:
+            # This thread already has an issue → the new message is a
+            # reply/forward that evolved it. Log + refresh, don't re-triage.
+            if ("thread_update", mid) not in taken:
+                created.append(enqueue(qdir, "thread_update", mid,
+                                       {"issue": issue, "message_id": mid, "thread_id": tid}))
+                taken.add(("thread_update", mid))
+        elif ("triage", mid) not in taken:
+            created.append(enqueue(qdir, "triage", mid, {"message_id": mid, "thread_id": tid}))
+            taken.add(("triage", mid))
+    # Bound the seen list so state.json can't grow without limit.
+    if len(ids) > 2000:
+        state["seen_message_ids"] = ids[-2000:]
+    return created
+
+
+def handle_job(job_type, cfg, payload, log, job_name):
+    """Process a "thread_update" job: log a Gmail thread evolution
+    (reply/forward) onto the linked issue and queue a forced dossier
+    refresh. Deterministic — no LLM. Returns None for any other job_type
+    (declines, falls through to the generic prompt-driven runner)."""
+    if job_type != "thread_update":
+        return None
+    from ...queue import queue_dir, enqueue, existing_targets
+
+    issue = payload.get("issue")
+    mid = payload.get("message_id")
+    if not issue or not mid:
+        return False, "thread_update missing issue/message_id"
+    client = _client(cfg)
+    issue_data = client.get_issue(issue)
+    if (issue_data.get("state") or "").lower() == "closed":
+        log.append({"job": job_name, "note": f"issue #{issue} closed — thread update skipped"})
+        return True, None
+    meta = _message_meta(cfg, mid)
+    body = (
+        f"📩 **Email thread update** — {meta['from']}"
+        + (f" · {meta['date']}" if meta["date"] else "")
+        + f"\n\n> {meta['subject']}\n\n{meta['snippet']}\n\n[Open in Gmail]({meta['url']})"
+    )
+    client.create_comment(issue, body)
+    # Refresh the dossier so it reflects the evolved thread. force=True because a
+    # new email is not a "user comment", so is_fresh() would otherwise skip it.
+    qdir = queue_dir(cfg)
+    if ("collect", str(issue)) not in existing_targets(qdir):
+        enqueue(qdir, "collect", str(issue), {"issue": issue, "force": True})
+    log.append({"job": job_name, "issue": issue, "logged": meta["subject"]})
+    return True, None
 
 
 # --------------------------------------------------------------------------

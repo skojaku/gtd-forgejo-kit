@@ -7,27 +7,30 @@ since it (those comments are the user's standing instructions).
 `dossier` turns a small flat JSON file into one correctly-marked, correctly-
 formatted issue comment, so the model never composes the format itself.
 
-Marker (first line of every agent comment, invisible in the GitHub UI):
+Marker (first line of every agent comment, invisible in the Forgejo UI):
     <!-- hq-dossier v1 2026-07-03T14:05Z -->
 """
 from datetime import datetime, timezone
 
 from .common import (
-    fail, run, run_json, load_config, repo, owner,
+    fail, load_config, owner, repo_name, forgejo_url,
     excerpt, print_json, read_params,
 )
+from .forgejo import ForgejoClient
 
 MARKER_PREFIX = "<!-- hq-dossier v1"
 VALID_SOURCES = ("gmail", "drive", "wiki", "calendar")
 NEEDS_DECISION_LABEL = "needs-decision"
 
 
+def _client(cfg):
+    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
+
+
 def _fetch_issue_and_comments(cfg, issue):
-    r = repo(cfg)
-    data = run_json(["gh", "api", f"repos/{r}/issues/{issue}"])
-    comments = run_json(["gh", "api", f"repos/{r}/issues/{issue}/comments", "--paginate"])
-    if isinstance(comments, dict):
-        comments = [comments]
+    client = _client(cfg)
+    data = client.get_issue(issue)
+    comments = client.list_comments(issue)
     return data, comments
 
 
@@ -167,12 +170,12 @@ def post_dossier(cfg, issue, params):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     body = _render(summary, entries, decision, now_utc)
 
-    r = repo(cfg)
-    run(["gh", "issue", "comment", str(issue), "--repo", r, "--body", body])
+    client = _client(cfg)
+    client.create_comment(issue, body)
     if decision:
         from .task import ensure_label
         ensure_label(cfg, NEEDS_DECISION_LABEL, color="d93f0b")
-        run(["gh", "issue", "edit", str(issue), "--repo", r, "--add-label", NEEDS_DECISION_LABEL])
+        client.add_labels(issue, [NEEDS_DECISION_LABEL])
 
     return {
         "issue": issue,

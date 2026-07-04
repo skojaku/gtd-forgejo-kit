@@ -25,6 +25,10 @@ only file new work into an Inbox state.
   (`hq wiki`). A filesystem job queue (`hq queue`) for async agent work.
 - **`bin/hqlib/forgejo.py`**. A ~150-line stdlib-only (`urllib`) REST
   client for Forgejo. No `gh`, no `tea`, no extra dependencies.
+- **`bin/hqlib/plugins/`**. Core (task/forgejo/queue/wiki) never imports a
+  plugin; `mail`/`cal`/`drive` are plugins — each its own folder, discovered
+  by name, never importing each other. Add your own the same way. See
+  ARCHITECTURE.md's "Plugin model".
 - **`docker/`** and **`deploy/compose.example.yaml`**. A two-container
   stack. Forgejo plus one app container running both a cron scheduler and
   an AI agent gateway. Tailscale-friendly, loopback-only port bindings.

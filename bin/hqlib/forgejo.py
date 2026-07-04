@@ -65,7 +65,7 @@ class ForgejoClient:
         req = urllib.request.Request(url, data=body, method=method)
         req.add_header("Authorization", f"token {self.token}")
         req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "hq-forgejo-client (youruser/HQ, 1.0)")
+        req.add_header("User-Agent", "hq-forgejo-client (see README, 1.0)")
 
         last_err = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -96,14 +96,19 @@ class ForgejoClient:
         return f"/repos/{self.owner}/{self.repo}{suffix}"
 
     # -- issues -----------------------------------------------------------
-    def list_issues(self, state: str = "all", labels: str | None = None) -> list[dict]:
-        """Paginated walk of all issues (type=issues excludes PRs)."""
+    def list_issues(self, state: str = "all", labels: str | None = None, since: str | None = None) -> list[dict]:
+        """Paginated walk of all issues (type=issues excludes PRs).
+
+        since: RFC3339 timestamp — only issues updated after it (any field,
+        not just comments — a superset is fine for a poll-and-recheck scan).
+        """
         items, page = [], 1
         while True:
             params = {
                 "type": "issues",
                 "state": state,
                 "labels": labels,
+                "since": since,
                 "limit": 50,
                 "page": page,
             }

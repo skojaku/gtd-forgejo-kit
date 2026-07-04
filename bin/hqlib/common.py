@@ -152,6 +152,43 @@ def forgejo_url(cfg):
 # Output shaping
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# gws (Google Workspace CLI) account resolution — shared by any plugin that
+# talks to gws (mail, drive, ...), and by core's queue.py for thread-update
+# bookkeeping. Lives here (not in the mail plugin) so plugins never import
+# each other.
+# --------------------------------------------------------------------------
+
+def resolve_account(cfg, name):
+    """Returns (account_key, config_dir_or_None, mail_url_index).
+
+    Account values are either a bare config-dir string (legacy) or a mapping
+    {config_dir, mail_url_index}. An empty config_dir means "use gws's own
+    default" (single-account host).
+    """
+    gt = cfg.get("gmail_triage") or {}
+    accounts = gt.get("accounts", {})
+    key = name or gt.get("default_account")
+    if not key or key not in accounts:
+        fail(f"unknown account '{key}'. Known accounts: {sorted(accounts)}")
+    raw = accounts[key]
+    if isinstance(raw, dict):
+        path = raw.get("config_dir") or ""
+        url_index = raw.get("mail_url_index", 0)
+    else:
+        path = raw or ""
+        url_index = 0
+    config_dir = str(Path(path).expanduser()) if path else None
+    return key, config_dir, url_index
+
+
+def gws_env(config_dir):
+    env = os.environ.copy()
+    if config_dir:
+        env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = config_dir
+    return env
+
+
 def excerpt(text, chars):
     """Whitespace-normalized, hard-truncated excerpt."""
     flat = " ".join((text or "").split())

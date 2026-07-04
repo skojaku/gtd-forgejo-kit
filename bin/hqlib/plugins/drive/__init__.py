@@ -5,8 +5,12 @@ No write verbs by design.
 """
 import json
 
-from .common import fail, run_json, load_config, excerpt, envelope, print_json
-from .mail import resolve_account, gws_env
+from ...common import (
+    fail, run_json, load_config, excerpt, envelope, print_json,
+    resolve_account, gws_env,
+)
+
+NAME = "drive"
 
 MIME_BY_TYPE = {
     "doc": "application/vnd.google-apps.document",

@@ -12,10 +12,12 @@ import json
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .common import (
+from ...common import (
     fail, run, run_json, load_config,
     envelope, print_json, read_params, is_valid_date,
 )
+
+NAME = "cal"
 
 WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 

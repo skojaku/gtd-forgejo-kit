@@ -62,16 +62,22 @@ visibility for more than one field, you only get to pick one (the
 
 ```
 bin/hq                       Unified CLI entry point (hq <domain> --help)
-bin/hqlib/
+bin/hqlib/                   CORE — never imports a plugin
   forgejo.py                 Stdlib-only REST client (urllib) for Forgejo's API
   task.py                    GTD command surface: add/list/update/done/defer/
                               comment/cron-daily/cron-cleanup — all built on
                               forgejo.py + the label/due_date/meta pattern above
   common.py                  Config loading + the read_meta/write_meta helpers
-  mail.py / cal.py / drive.py  Gmail / Calendar / Drive integration (via `gws`)
-  queue.py                   Filesystem job queue for async agent work
+  queue.py                   Filesystem job queue for async agent work; core
+                              handles "collect" jobs directly, offers every
+                              other job type to each plugin's handle_job()
+                              hook before falling back to the generic runner
   wiki.py                    Local Markdown note search + Forgejo blob links
   dossier.py                 Posts agent-collected context as issue comments
+  plugins/                   Plugin loader (see "Plugin model" below)
+    mail/ cal/ drive/        Gmail / Calendar / Drive connectors (via `gws`) —
+                              each its own folder, each may import core, never
+                              another plugin
 docker/
   entrypoint.sh               Sets up Forgejo git credentials, launches an
                                AI agent gateway in a background restart loop,
@@ -97,6 +103,31 @@ config/
                                AGENTS.md) — task, mail, cal, drive, collect,
                                triage, wiki, setup
 ```
+
+## Plugin model
+
+Core (`task.py`, `forgejo.py`, `common.py`, `dossier.py`, `queue.py`,
+`wiki.py`) never imports a plugin. Everything source-specific — Gmail,
+Calendar, Drive, or whatever you add — is a plugin: a folder under
+`bin/hqlib/plugins/<name>/`, discovered by folder name, contributing its own
+`hq <name> ...` subcommand. This localizes a broken/half-finished connector
+to itself; it can't take down the CLI or another plugin.
+
+Contract (`bin/hqlib/plugins/__init__.py` has the full docstring):
+- `NAME`: must match the folder name.
+- `register(subparsers)`: required — wires the `hq <name> ...` subcommand.
+- `scan(cfg, state, qdir, taken) -> list[str]`: optional — called by
+  `hq queue scan` for plugins that detect their own events (new mail, etc).
+- `handle_job(job_type, cfg, payload, log, job_name) -> (ok, err) | None`:
+  optional — called by `hq queue work` for job types this plugin created via
+  its own `scan()`; return `None` to decline (falls through to the generic
+  prompt-driven runner — this is why "triage" needs no plugin-specific code
+  at all, just a prompt template).
+
+A plugin may import from `hqlib.common` / `hqlib.forgejo` / `hqlib.queue`
+(core) — never from another plugin. If two plugins need to share something
+(the `mail` and `drive` plugins both need gws account resolution), that
+shared piece belongs in `common.py`, not in one plugin importing the other.
 
 ## Container model
 
