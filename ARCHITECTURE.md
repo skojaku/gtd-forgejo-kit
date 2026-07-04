@@ -29,7 +29,7 @@ context/calls   context/reading
 ```
 
 Create via `POST /api/v1/repos/{owner}/{repo}/labels` with
-`"exclusive": true`. See `scripts/migrate/create-labels.py` for a template.
+`"exclusive": true`.
 
 ### One date field -> native `due_date`
 
@@ -82,8 +82,6 @@ docker/
                                gateway acting as your "information collector"
 scripts/
   discord-issue-sync.py       Mirrors "Next"-labeled issues to Discord threads
-  migrate/                    One-shot scripts for migrating an existing
-                               GitHub Projects V2 board onto Forgejo (below)
   hermes-setup.sh              Provisions isolated Hermes profiles/brains
   hq-runner.sh / hq-kill.sh    Example remote-worker + teardown scripts
 deploy/
@@ -117,28 +115,6 @@ exec supercronic /path/to/docker/crontab
 Forgejo runs as a second container. Bind its ports to loopback + a private
 network only (Tailscale, WireGuard, ...) — never `0.0.0.0` — since it now
 holds all your task/note data. See `deploy/compose.example.yaml`.
-
-## Migrating an existing GitHub Projects V2 board
-
-`scripts/migrate/` is a 4-step, idempotent, `--dry-run`-capable pipeline:
-
-1. **`snapshot-fields.sh`** — while GitHub is still live, dump every
-   project item's field values to `fields.json` via the Projects V2 GraphQL
-   API. Read-only.
-2. **`create-labels.py`** — create your exclusive scoped labels on the
-   target Forgejo repo.
-3. **`apply-fields.py`** — for each `fields.json` entry: swap in the right
-   scoped labels, set `due_date`, write the meta body block.
-4. **`verify-migration.py`** — asserts open/closed issue counts match
-   between GitHub and Forgejo, every snapshotted issue exists with a
-   matching title, and status-labeled counts add up; prints a few random
-   issues for a manual spot-check.
-
-Run the actual GitHub -> Forgejo repo migration itself via Forgejo's
-built-in GitHub importer (`POST /repos/migrate` or the web UI's "New
-Migration" — imports issues, comments, labels, milestones, PRs, and
-preserves issue numbers) *before* step 3, so `apply-fields.py` has real
-issues to attach labels to.
 
 ## Cron replacement
 
