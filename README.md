@@ -1,18 +1,17 @@
 # gtd-forgejo-kit
 
-A personal GTD (Getting Things Done) / knowledge-collector system, built on
-a self-hosted [Forgejo](https://forgejo.org/) instance instead of GitHub.
-Started as a real migration off GitHub Projects V2 — GitHub's custom project
-fields have no self-hostable equivalent, so this repo shows a working
-pattern for replacing them with plain Forgejo primitives (labels + one date
-field + a body comment block). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for
-the full design.
+A personal GTD (Getting Things Done) / knowledge-collector system, built
+entirely on a self-hosted [Forgejo](https://forgejo.org/) instance: issues
+are tasks, labels are GTD state, and an AI agent gateway does the legwork.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the field-mapping design
+works (labels + one date field + a body comment block, replacing what a
+tool like GitHub Projects would give you natively).
 
-**You are an information collector, not a decision maker** is the core
-philosophy: AI agents gather, link, summarize, and draft; you make every
-judgment call (promote a task, book a meeting, send an email). The CLI
-enforces this — there is no "send email" verb, booking requires an explicit
-approval flag, and agents can only file new work into an Inbox state.
+**Core philosophy: the AI agent is an information collector, not a decision
+maker.** It gathers, links, summarizes, and drafts; you make every judgment
+call (promote a task, book a meeting, send an email). The CLI enforces this
+— there is no "send email" verb, booking requires an explicit approval
+flag, and the agent can only file new work into an Inbox state.
 
 ## What's in here
 

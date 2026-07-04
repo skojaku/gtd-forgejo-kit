@@ -1,12 +1,11 @@
 # Architecture
 
-A personal GTD/knowledge system built on a self-hosted Forgejo instance
-instead of GitHub. Originated as a migration off GitHub Projects V2 (which
-has no self-hostable equivalent — Forgejo has no GraphQL API and no custom
-project fields), so the core design problem this repo solves is: **how do
-you replicate GitHub Projects V2's custom fields (Status, Context, Due,
-Defer, Scheduled, Booked, Duration, ...) using only what a plain Forgejo
-issue gives you?**
+A personal GTD/knowledge system built entirely on a self-hosted Forgejo
+instance. The core design problem: Forgejo has no GraphQL API and no custom
+project fields (nothing like GitHub Projects V2's Status/Context/Due/Defer/
+Scheduled/Booked/Duration). So: **how do you get a rich, multi-field GTD
+state machine using only what a plain Forgejo issue gives you — labels, one
+due date, and a Markdown body?**
 
 ## The field-mapping pattern
 
