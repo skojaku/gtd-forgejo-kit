@@ -116,6 +116,31 @@ Forgejo runs as a second container. Bind its ports to loopback + a private
 network only (Tailscale, WireGuard, ...) — never `0.0.0.0` — since it now
 holds all your task/note data. See `deploy/compose.example.yaml`.
 
+## Worker model
+
+Heavy jobs (dossier collection against a big local model) are pulled from a
+filesystem job queue on the master by whichever worker claims them first —
+not pushed by the master to a fixed target. Any number of worker machines
+can run `hq queue work --remote <master-ssh-alias>` on their own schedule
+(cron/launchd/systemd); each just needs the `hq` CLI, a `FORGEJO_TOKEN` (or
+token file), its own local model, and ssh reachability to the master. The
+master doesn't need to know how many workers exist — adding one is zero
+master-side change.
+
+Priority is just claim order/frequency, not a strict failover chain: a
+preferred worker polls often; a lower-priority one (e.g. the master's own
+GPU, `scripts/master-local-worker.sh` + `scripts/gpu-check.sh`) only claims
+a job once it's aged past a threshold *and* that worker's own GPUs are
+free — it stays out of the way otherwise. Give every lower-priority worker
+the *same* flat threshold rather than chaining thresholds per worker, so
+worst-case wait stays bounded as you add more workers instead of compounding.
+
+Optionally, split the master's own local worker into its own container
+(`hq-worker` in `deploy/compose.example.yaml`, same image, `HQ_ROLE=worker`
+skips the agent gateway, runs `docker/crontab.worker` instead of
+`docker/crontab`) — symmetric with how a remote worker operates, just local
+instead of over ssh.
+
 ## Cron replacement
 
 GitHub Actions workflows become `hq task cron-daily` / `hq task

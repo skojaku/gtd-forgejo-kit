@@ -48,12 +48,16 @@ if [[ "${HQ_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
-# Merged container: run the Hermes Discord gateway in the background (with
+# Master container: run the Hermes Discord gateway in the background (with
 # an auto-restart loop, since it's not supervised by anything else) and the
-# supercronic cron daemon in the foreground as PID 1's exec target.
-( while true; do
-    hermes -p hq-github gateway run 2>&1 | sed 's/^/[hermes] /'
-    echo "[hermes] exited ($?), restarting in 5s"; sleep 5
-  done ) &
+# supercronic cron daemon in the foreground as PID 1's exec target. Worker
+# containers (HQ_ROLE=worker — same image, different compose service) skip
+# the gateway entirely; they only run supercronic against a worker crontab.
+if [[ "${HQ_ROLE:-master}" == "master" ]]; then
+    ( while true; do
+        hermes -p hq-github gateway run 2>&1 | sed 's/^/[hermes] /'
+        echo "[hermes] exited ($?), restarting in 5s"; sleep 5
+      done ) &
+fi
 
 exec "$@"

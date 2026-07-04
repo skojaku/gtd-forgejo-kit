@@ -1,0 +1,13 @@
+# HQ local-worker container crontab — executed by supercronic inside the
+# hq-worker service (same image as the master's hq container, HQ_ROLE=worker
+# so entrypoint.sh skips the Hermes gateway). This is the master machine's
+# own lower-priority collect worker, symmetric with a remote worker
+# (scripts/hq-runner.sh) except it runs locally instead of over ssh.
+#
+# master-local-worker.sh only actually claims a job when (1) a collect job
+# has waited >20m in pending AND (2) this machine's GPUs are free — so it
+# stays out of the way while remote workers are keeping up. See the script
+# for the full gating logic.
+
+*/5  * * * * git -C /home/youruser/HQ pull --rebase --autostash origin main
+*/5  * * * * /home/youruser/HQ/scripts/master-local-worker.sh

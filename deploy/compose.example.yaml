@@ -38,6 +38,13 @@ services:
     group_add: ["${DOCKER_GID}"]   # `getent group docker` on the host
     working_dir: /home/YOUR_USER/HQ
     env_file: /home/YOUR_USER/HQ/.env
+    environment:
+      HOME: /home/YOUR_USER
+      TZ: America/New_York        # your timezone — cron-daily/cron-cleanup run on this
+      HQ_ROLE: master              # runs the Hermes gateway + dispatch crontab
+      GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND: file
+      GOOGLE_WORKSPACE_CLI_CONFIG_DIR: /home/YOUR_USER/.config/gws
+      PI_OFFLINE: "1"
     volumes:
       - ~/HQ:/home/YOUR_USER/HQ
       - ~/.config/gws:/home/YOUR_USER/.config/gws
@@ -47,12 +54,38 @@ services:
       - ~/.hermes:/home/YOUR_USER/.hermes
       - ~/.email-triage:/home/YOUR_USER/.email-triage
       - /var/run/docker.sock:/var/run/docker.sock
+
+  # Optional: the master machine's own lower-priority collect worker (see
+  # ARCHITECTURE.md's worker model). Same image as `hq`, just a different
+  # role/crontab — no Hermes gateway (HQ_ROLE=worker), no ~/.hermes mount.
+  # Symmetric with a remote worker (scripts/hq-runner.sh over ssh), except
+  # this one runs locally on the master's own GPUs, lower priority than any
+  # remote worker.
+  hq-worker:
+    build: ..
+    image: hq-container
+    container_name: hq-worker
+    restart: unless-stopped
+    network_mode: host          # reaches the local model endpoint + forgejo
+    user: "${UID}:${GID}"
+    group_add: ["${DOCKER_GID}"]
+    working_dir: /home/YOUR_USER/HQ
+    env_file: /home/YOUR_USER/HQ/.env
+    command: ["/usr/local/bin/supercronic", "-passthrough-logs", "/home/YOUR_USER/HQ/docker/crontab.worker"]
     environment:
       HOME: /home/YOUR_USER
-      TZ: America/New_York        # your timezone — cron-daily/cron-cleanup run on this
+      TZ: America/New_York
+      HQ_ROLE: worker
       GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND: file
       GOOGLE_WORKSPACE_CLI_CONFIG_DIR: /home/YOUR_USER/.config/gws
       PI_OFFLINE: "1"
+    volumes:
+      - ~/HQ:/home/YOUR_USER/HQ
+      - ~/.config/gws:/home/YOUR_USER/.config/gws
+      - ~/.config/hq:/home/YOUR_USER/.config/hq:ro
+      - ~/.agents:/home/YOUR_USER/.agents:ro
+      - ~/.pi:/home/YOUR_USER/.pi
+      - /var/run/docker.sock:/var/run/docker.sock
 
 networks:
   hq: {}
