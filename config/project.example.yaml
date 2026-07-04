@@ -1,0 +1,8 @@
+# Public project identifiers — committed and shared by the hq CLI, so they
+# live in exactly one tracked place. Everything else (working hours, accounts,
+# ...) stays in the gitignored env.yaml.
+#
+# Copy this file to config/project.yaml and fill in your own values.
+owner: your-forgejo-username
+repo: your-username/your-repo
+forgejo_url: http://your-forgejo-host:3000

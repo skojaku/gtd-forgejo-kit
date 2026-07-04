@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""hq — unified HQ CLI: task / mail / cal / drive / wiki / queue.
+
+One entry point wrapping `gh` (GitHub Projects v2), `gws` (Google Workspace)
+and `rg` (wiki search). Every command prints small, capped JSON to stdout and
+exits nonzero with {"error": "..."} on failure. Run `hq --help` for the tree.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hqlib.cli import main
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,29 @@
+# HQ recurring jobs — executed by supercronic inside the hq container.
+# 5-field cron syntax (m h dom mon dow); no user column.
+# stdout/stderr are captured by supercronic and streamed to container logs.
+#
+# The container is the aster-side entry point of the queue architecture:
+# it detects events (new mail / issue activity), files them as jobs under
+# ~/HQ/queue, and runs lightweight single-message triage with a small local
+# model. Heavy collect/full-sweep jobs are claimed by the Mac runner over ssh
+# (scripts/hq-runner.sh) and processed on mtplx Qwen3.6-27B.
+
+*/5  * * * * git -C /home/youruser/HQ pull --rebase --autostash origin main
+
+*/5  * * * * /home/youruser/HQ/bin/hq queue scan
+*/5  * * * * /home/youruser/HQ/bin/hq queue work --types triage,thread_update --max 3
+
+# Mirror GitHub "Next" issues to Discord threads (open on Next, archive on
+# close). 1 GraphQL call/run; reuses the hq-github Hermes bot token.
+*/10 * * * * python3 /home/youruser/HQ/scripts/discord-issue-sync.py
+
+# Dossier fallback: if the Mac runner falls behind (a collect job waits >20m)
+# AND the GPUs are idle, aster processes collect jobs itself on local
+# qwen3.6:27b. Holds (waits for next tick) whenever GPUs are busy.
+*/10 * * * * /home/youruser/HQ/scripts/aster-collect-fallback.sh
+
+# GTD daily/cleanup housekeeping (ported from GitHub Actions gtd-daily.yml /
+# gtd-cleanup.yml). Container TZ is America/New_York, so these run at local
+# 8am/2am — no more UTC/DST drift to reason about.
+0 8 * * * /home/youruser/HQ/bin/hq task cron-daily
+0 2 * * * /home/youruser/HQ/bin/hq task cron-cleanup
