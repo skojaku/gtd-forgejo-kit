@@ -1,89 +1,115 @@
 # gtd-forgejo-kit
 
-Personal GTD (Getting Things Done) and knowledge-collector system. Built
-entirely on a self-hosted [Forgejo](https://forgejo.org/) instance. Issues
-are tasks. Labels are GTD state. An AI agent gateway does the legwork. See
-[`ARCHITECTURE.md`](ARCHITECTURE.md) for the field-mapping design.
+I have kept my to-do list in a lot of places over the years: paper, Reminders,
+OmniFocus, and most recently GitHub Projects. The tools I kept going back to were
+the board-style ones. Not because of the checkboxes, but because each card slowly
+collects the things I need before I can decide what to do: the email that started
+it, a link to a document, a note from a meeting, my own half-thoughts. The board is
+where information piles up until I can act on it.
 
-## Core philosophy
+At some point I started wondering how much of that pile-up a computer could do for
+me. When an email arrives, could something read it, decide whether it is actually a
+task, and file a card with a draft reply already written? When I open a task, could
+the related emails and documents already be sitting there, so I am not digging for
+them?
 
-Everything stays local. Forgejo, the CLI, the agent gateway, the job queue.
-All run on your own machine or private network. Nothing leaves your
-control.
+An AI can do this. The problem is what I would have to hand it. My tasks touch
+student records, unpublished work, and private messages from other people. I do not
+want to send that to a company's servers, and under the policies I work with I am
+not allowed to. So the useful version of this idea and the version I am permitted to
+use pull in opposite directions.
 
-The AI agent is an information collector, not a decision maker. It gathers,
-links, summarizes, and drafts. You make every judgment call. Promote a
-task. Book a meeting. Send an email. The CLI enforces this. There is no
-send-email verb. Booking needs an explicit approval flag. The agent can
-only file new work into an Inbox state.
+The way out is to run the AI on my own machine, on data that never leaves it. This
+repository is where I landed: a task board that lives in a git server I host myself,
+and small AI models running locally that do the gathering. Nothing goes to a cloud
+service.
 
-## What's in here
+## How it works
 
-- **`bin/hq`**. One CLI for everything. Tasks (`hq task`). Email (`hq
-  mail`, Gmail via [`gws`](https://github.com/GAM-team/GYB)-style tooling).
-  Calendar (`hq cal`). Drive (`hq drive`, read-only). Local wiki search
-  (`hq wiki`). A filesystem job queue (`hq queue`) for async agent work. A
-  live, grouped-by-status board (`hq ui serve`, read-only, stdlib only).
-- **`bin/hqlib/forgejo.py`**. A ~150-line stdlib-only (`urllib`) REST
-  client for Forgejo. No `gh`, no `tea`, no extra dependencies.
-- **`bin/hqlib/plugins/`**. Core (task/forgejo/queue/wiki) never imports a
-  plugin; `mail`/`cal`/`drive`/`ui` are plugins — each its own folder,
-  discovered by name, never importing each other. Add your own the same
-  way. See ARCHITECTURE.md's "Plugin model".
-- **`docker/`** and **`deploy/compose.example.yaml`**. A two-container
-  stack. Forgejo plus one app container running both a cron scheduler and
-  an AI agent gateway. Tailscale-friendly, loopback-only port bindings.
-- **`.agents/skills/`**. Short task recipes for driving an AI agent.
-  Triage incoming email into task cards. Collect context into a dossier
-  comment. Written for small, local models.
+Your tasks are issues in a [Forgejo](https://forgejo.org/) repository that only you
+can reach. Forgejo is a self-hosted git server, close to a private GitHub that you
+run and whose data you hold. Each issue carries a label for its state (Inbox, Next,
+Waiting, Done, and the rest), so the issue list is also your board.
 
-## Quick start
+Two local models do the work you would rather not:
 
-1. **Stand up Forgejo.** Copy `deploy/compose.example.yaml`. Fill in your
-   domain or Tailscale IP. Run `docker compose up -d forgejo`. Create an
-   admin user. Generate an API token.
-2. **Configure.**
-   ```bash
-   cp config/project.example.yaml config/project.yaml   # owner/repo/forgejo_url
-   cp config/env.example.yaml config/env.yaml            # your name, working hours, ...
-   mkdir -p ~/.config/hq && echo -n "<your token>" > ~/.config/hq/forgejo-token
-   chmod 600 ~/.config/hq/forgejo-token
-   ```
-3. **Set up `gws`** (Gmail, Calendar, Drive access). Install it. Authorize
-   it. Point `env.yaml` at the resulting profile.
-   ```bash
-   npm install -g @googleworkspace/cli
-   export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=~/.config/gws-work   # one dir per account
-   gws auth login                                              # opens a browser
-   gws auth status                                              # confirm it worked
-   ```
-   Repeat with a different `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` for each extra
-   account (work, personal, ...). List each profile's dir under
-   `gmail_triage.accounts.<name>.config_dir` in `config/env.yaml`.
-4. **Build and run the app container.**
-   ```bash
-   docker compose -f deploy/compose.example.yaml up -d --build hq
-   docker exec hq bin/hq task summary
-   ```
-5. **Wire up an AI agent gateway** (optional). See `scripts/hermes-setup.sh`
-   for one way to do this with [Hermes Agent](https://hermes-agent.nousresearch.com).
-   Adapt `docker/hermes-hq-soul.md` (the agent's system prompt) and
-   `docker/entrypoint.sh` for whatever gateway you use.
-6. **Nightly backups.** `deploy/backup-forgejo.sh` runs `forgejo dump` and
-   copies the archive off-container. Schedule it with cron or systemd on
-   the host, not inside the container, so it survives a container rebuild.
+- A small, fast one watches your inbox. When mail comes in it decides whether it is
+  worth a task. If it is, it writes the task card and a draft reply. The rest it
+  leaves alone.
+- A larger one gathers background. When a task needs context, it searches your
+  email, Drive, and notes, and posts what it finds as a comment on the task, with
+  links back to each source.
 
-## Design notes worth reading before you customize
+You make every real decision. The AI can file a new task into your Inbox and draft a
+reply, but it cannot send email, and it cannot put anything on your calendar unless
+you say so explicitly. It gathers and suggests. You choose.
 
-- Every command's JSON output is small and capped on purpose. Built to be
-  driven by small, local LLMs, not just humans.
-- The label, due-date, body-metadata field-mapping pattern in
-  `ARCHITECTURE.md` generalizes to any custom-field system on Forgejo, or
-  any issue tracker with only labels, one date field, and a body.
-- `config/project.yaml` is committed. Owner, repo, forgejo_url. No secrets.
-  `config/env.yaml` is gitignored. Personal working hours, accounts.
-  Tokens never go here either. Tokens live in `~/.config/hq/forgejo-token`
-  or the `FORGEJO_TOKEN` env var.
+## Why it runs locally
+
+This is the whole point, so it is worth being plain about it. The models run on your
+own hardware. Your email, your documents, and your tasks are read on the machine you
+control and are never sent to an outside service. If you work with data that you are
+responsible for keeping private, whether by preference or by policy, this is what
+makes an AI assistant usable at all rather than something you have to keep at arm's
+length.
+
+The trade is that you host a few things yourself and the models are smaller than the
+big cloud ones. In practice the small model is more than good enough to sort email,
+and the larger one is good enough to pull together context. Neither has to be
+brilliant, because they are not deciding anything.
+
+## What is in here
+
+- `bin/hq` — one command-line tool for everything: tasks, mail, calendar, Drive,
+  wiki search, and the job queue that feeds the AI.
+- `deploy/compose.yaml` — a Docker setup that runs Forgejo, the local model server
+  (Ollama), and a scheduler that checks your inbox and runs the housekeeping.
+- `.agents/skills/` — short, plain-language instructions that tell the AI how to do
+  each job (triage an email, collect context for a task).
+- `ARCHITECTURE.md` — how tasks map onto Forgejo issues and labels, for when you want
+  to change how it works.
+
+## Getting started
+
+There are three levels, depending on how much you want to run.
+
+**Just the command line.** If you already have a Forgejo instance somewhere, you only
+need Python, [`gws`](https://github.com/google/googleworkspace-cli) for Google
+access, and ripgrep. Copy `config/hq.example.yaml` to `config/hq.yaml`, point it at
+your Forgejo, drop your API token in `~/.config/hq/forgejo-token`, and run
+`./bin/hq task list`.
+
+**The whole thing on one machine.** This is the usual setup: Forgejo, the local
+models, and the inbox-watching scheduler, all in Docker. You need Docker and, for the
+larger model, a GPU helps a lot.
+
+```bash
+cp .env.example .env          # your timezone, machine details, Forgejo token
+./bin/hq setup                # walks you through Forgejo, the token, and the labels
+docker compose -f deploy/compose.yaml up -d
+./bin/hq doctor               # tells you what, if anything, is still wrong
+```
+
+`hq setup` asks you a few questions and does the fiddly parts (creating the
+repository, the API token, and the task-state labels). `hq doctor` is the thing to
+run whenever something seems off; it checks each piece and prints how to fix what is
+broken.
+
+**A second machine for the heavy model.** If you want the context-gathering to run on
+a separate box (say, one with a bigger GPU), point its worker at your main machine's
+Forgejo and it will pick up jobs from there.
+
+Fuller setup notes, including Google account access for mail and calendar, are in
+`ARCHITECTURE.md`.
+
+## A few honest caveats
+
+This is opinionated and built around how I work, so expect to change things. Standing
+it up is more effort than installing an app; you are running a small server. And the
+local models are not the frontier cloud ones, which is a deliberate cost of keeping
+the data at home. If none of that appeals, a hosted to-do app is a perfectly good
+answer. I built this because for my data it was the only answer I was comfortable
+with.
 
 ## License
 
