@@ -1,6 +1,6 @@
 """hq drive — read-only Google Drive search + excerpt via `gws`.
 
-Uses the same account/config-dir mapping as mail (gmail_triage.accounts).
+Uses the same account/config-dir mapping as mail (google.accounts).
 No write verbs by design.
 """
 import json
@@ -11,6 +11,18 @@ from ...common import (
 )
 
 NAME = "drive"
+
+BIN_DEPS = ["gws"]
+
+# Shares google.accounts with the mail plugin (same config_dir/account
+# resolution) — duplicated here, not imported, per the no-cross-plugin-import
+# rule. Deep-merge is a no-op if `mail` already scaffolded this section.
+CONFIG_STUB = {
+    "google": {
+        "default_account": "",
+        "accounts": {},  # add one entry per account, e.g. work: {config_dir: "", mail_url_index: 0}
+    },
+}
 
 MIME_BY_TYPE = {
     "doc": "application/vnd.google-apps.document",
@@ -134,7 +146,7 @@ def cmd_excerpt(args):
 
 
 def register(sub):
-    p = sub.add_parser("drive", help="Google Drive (read-only: find + excerpt)")
+    p = sub.add_parser("drive", help="Google Drive (read-only: find + show)")
     s2 = p.add_subparsers(dest="drive_cmd", required=True)
 
     s = s2.add_parser("find", help="search files by content and/or name")
@@ -142,10 +154,10 @@ def register(sub):
     s.add_argument("--name", help="words in the file name")
     s.add_argument("--type", choices=sorted(MIME_BY_TYPE) + ["any"], default="any")
     s.add_argument("--account")
-    s.add_argument("--max", type=int, default=8)
+    s.add_argument("--max", type=int, default=10)
     s.set_defaults(func=cmd_find)
 
-    s = s2.add_parser("excerpt", help="plain-text excerpt of a Google Doc (window around --query if given)")
+    s = s2.add_parser("show", help="plain-text excerpt of a Google Doc (window around --query if given)")
     s.add_argument("file_id")
     s.add_argument("--query", help="center the excerpt on this phrase")
     s.add_argument("--max-chars", dest="max_chars", type=int, default=600)

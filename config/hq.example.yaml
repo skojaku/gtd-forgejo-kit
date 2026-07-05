@@ -1,0 +1,72 @@
+# HQ configuration — copy to config/hq.yaml and fill in your values.
+# config/hq.yaml is gitignored: it stays local to your machine and holds all
+# personal identifiers (Forgejo host, accounts, working hours).
+
+user:
+  username: your-username            # Forgejo login / repo owner (also "the user" for issue comments)
+  timezone: America/New_York         # IANA timezone (feeds the CLI; TZ in .env feeds compose)
+repo:
+  name: your-username/HQ             # Forgejo owner/repo slug
+
+# Forgejo backend — personal, so it lives here (not committed).
+forgejo_url: http://forgejo.example.ts.net:3000   # base URL of your Forgejo instance
+
+working_hours:
+  # Working-hour blocks per weekday (local timezone), consumed by `hq cal`.
+  # Each block is "HH:MM-HH:MM". Empty list = no working hours.
+  monday:    ["09:00-12:00", "13:00-17:00"]
+  tuesday:   ["09:00-12:00", "13:00-17:00"]
+  wednesday: ["09:00-12:00", "13:00-17:00"]
+  thursday:  ["09:00-12:00", "13:00-17:00"]
+  friday:    ["09:00-12:00", "13:00-17:00"]
+  saturday:  []
+  sunday:    []
+  commute:                           # optional commute gap — never bookable
+    start: ""                        # e.g. "14:40"
+    end: ""                          # e.g. "15:00"
+  max_bookable_pct: 80               # cap daily bookable time at this %
+  min_free_min: 30                   # always leave at least this many minutes free
+
+# Discord issue mirror (`hq discord` plugin). Optional — omit to disable.
+discord:
+  guild_id: ""                       # Discord server (guild) ID
+  next_channel_id: ""                # parent text channel ID that hosts the threads
+  bot_token_env: "~/.hermes/profiles/hq-local/.env"  # file holding DISCORD_BOT_TOKEN
+
+# Google Workspace accounts — shared by the mail and drive plugins.
+google:
+  default_account: work
+  accounts:
+    # config_dir: GOOGLE_WORKSPACE_CLI_CONFIG_DIR for this account. Leave empty
+    #   if this host has one gws account at the default location.
+    # mail_url_index: the account's position in your browser's Gmail account
+    #   switcher (https://mail.google.com/mail/u/<index>/) — used to build
+    #   clickable message links in dossiers.
+    work:
+      config_dir: "~/.config/gws-work"
+      mail_url_index: 0
+    personal:
+      config_dir: "~/.config/gws-personal"
+      mail_url_index: 1
+
+collect:
+  max_entries: 12                    # cap on sources per dossier comment
+  excerpt_chars: 400                 # cap on each excerpt
+
+queue:
+  dir: queue                         # job queue dir (gitignored), relative to repo root
+  ollama_url: http://ollama:11434    # local ollama base URL; the OLLAMA_URL env var overrides
+  stale_min: 60                      # a claimed job older than this is returned to pending
+  runners:
+    # Per-job-type LLM config for `hq queue work`. Two mechanisms:
+    #   triage  -> ONE direct ollama structured-output call (small model, no agent)
+    #   collect -> a hermes agent loop (large local model, multi-step tool use)
+    triage:                          # lightweight: classify one email -> task card + draft
+      model: qwen3.5:4b              # small local model; must support structured outputs
+      prompt: scripts/prompts/triage.md
+      timeout_min: 10
+    collect:                         # heavy: dossier collection across mail/drive/wiki
+      model: qwen3.6:27b             # large local model, driven by hermes
+      profile: hq-local              # hermes profile (see scripts/hermes-setup.sh)
+      prompt: scripts/prompts/collect.md
+      timeout_min: 20

@@ -1,24 +1,29 @@
-Triage exactly one email. Message id: {{message_id}}
+You are triaging a single email for a personal GTD (getting-things-done) system.
+The full email is given below. Read it and produce a structured result — you are
+not running any tools, just judging this one message.
 
-Step 1 — read it (run from the repo root):
-    ./bin/hq mail read {{message_id}}
+Classify the email as exactly one category:
+- "task": it asks the user for real work, a decision, a deadline, or a
+  deliverable, OR it needs a reply the user must write themselves.
+- "noise": newsletter, notification, receipt, automated alert, calendar invite
+  the calendar already handles, or spam — nothing the user must personally act on.
 
-Step 2 — classify it as exactly one of:
-- TASK: it asks the user for real work, a decision, a deadline, a deliverable,
-  OR a reply the user must write themselves.
-- NOISE: newsletter, notification, receipt, automated alert, spam.
+Then fill in the fields:
+- category: "task" or "noise".
+- task_title: for a task, a short verb-first summary of what the user must do
+  (e.g. "Reply to Dean about the budget deadline"). Empty string for noise.
+- task_body: for a task, 1-3 sentences of the context the user needs to act —
+  who is asking, what they want, and any date/deadline. Empty string for noise.
+- draft_reply: if this email needs a reply the user must send, write a concise,
+  polite draft reply in the user's own first-person voice (no salutations block,
+  just the message body). Empty string if no reply is needed or for noise.
 
-Step 3 — act:
-- TASK → write a file /tmp/triage-{{message_id}}.json containing
-      {"title": "<verb-first summary>", "notes": "From: <sender>\nEmail: <url from step 1 output>\n<!-- email-thread:{{thread_id}} -->"}
-  Copy the `<!-- email-thread:... -->` line EXACTLY as written — it links future
-  replies on this email thread back to this issue. Then run:
-      ./bin/hq task add /tmp/triage-{{message_id}}.json
-  Success = the command prints an issue number.
-- NOISE → do nothing.
+Judge conservatively: when unsure whether something is actionable, prefer
+"task" so nothing important is dropped, but do not invent work that isn't there.
 
-Rules: never claim you ran a command you did not run. Never use any command
-other than `./bin/hq mail read` and `./bin/hq task add`. Never create email
-drafts. Do not change task statuses, labels, or email state.
+Email:
+From: {{from}}
+Subject: {{subject}}
+Date: {{date}}
 
-Step 4 — report in one line: the classification, and the issue number / "skipped".
+{{body}}

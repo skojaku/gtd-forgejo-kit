@@ -78,6 +78,9 @@ bin/hqlib/                   CORE — never imports a plugin
     mail/ cal/ drive/        Gmail / Calendar / Drive connectors (via `gws`) —
                               each its own folder, each may import core, never
                               another plugin
+    ui/                       Local live board view (stdlib http.server, read-
+                              only) — a pure presentation layer over task.py,
+                              no scan()/handle_job() at all
 docker/
   entrypoint.sh               Sets up Forgejo git credentials, launches an
                                AI agent gateway in a background restart loop,
@@ -181,9 +184,11 @@ container's local timezone (no more UTC-vs-local drift math). Both support
 
 ## What you don't get
 
-- No kanban board UI (closest substitute: a bookmarked, label-filtered issue
-  list URL).
-- Every field except one is invisible in the web UI.
+- No kanban board *in Forgejo's own web UI* — but `hq ui serve` gives you a
+  live, grouped-by-status board over HTTP (loopback-only by default), built
+  entirely on `task.py` + stdlib `http.server`. Every field except `due_date`
+  is still invisible in Forgejo's native web UI, this is a separate window
+  onto the same data, not a Forgejo feature.
 - If you were relying on GitHub's rate limits shaping your architecture
   (e.g. "one GraphQL call per run"), you can drop that constraint entirely
   — a self-hosted instance has no meaningful rate limit.

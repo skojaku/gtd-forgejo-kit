@@ -1,26 +1,32 @@
-# HQ recurring jobs — executed by supercronic inside the hq container.
-# 5-field cron syntax (m h dom mon dow); no user column.
-# stdout/stderr are captured by supercronic and streamed to container logs.
+# HQ recurring jobs — run by supercronic inside the hq-cron container.
+# 5-field cron syntax (m h dom mon dow); no user column. Paths are relative to
+# the bind-mounted repo at /hq. stdout/stderr are captured by supercronic and
+# streamed to container logs. Container TZ comes from .env (TZ), so the daily
+# entries below run at local time with no UTC/DST drift.
 #
-# This container is the master's dispatch entry point of the queue
-# architecture: it detects events (new mail / issue activity), files them as
-# jobs under ~/HQ/queue, and runs lightweight single-message triage with a
-# small local model. Heavy collect/full-sweep jobs are claimed by workers
-# (scripts/hq-runner.sh over ssh for remote workers; docker/crontab.worker's
-# master-local-worker.sh for the master's own lower-priority local worker, a
-# SEPARATE container — see the hq-worker service in deploy/compose.example.yaml).
+# This container is the dispatch entry point of the queue: it keeps the tree
+# current, detects events (new mail / issue activity), files them as jobs, and
+# runs lightweight single-message triage with a small local model. Heavy
+# collect jobs are claimed by the hq-worker service (docker/crontab.worker).
 
-*/5  * * * * git -C /home/youruser/HQ pull --rebase --autostash origin main
+# The one and only git-pull loop.
+*/5  * * * * git -C /hq pull --rebase --autostash origin main
 
-*/5  * * * * /home/youruser/HQ/bin/hq queue scan
-*/5  * * * * /home/youruser/HQ/bin/hq queue work --types triage,thread_update --max 3
+# Event detection + lightweight triage.
+*/5  * * * * /hq/bin/hq queue scan
+*/5  * * * * /hq/bin/hq queue work --types triage,thread_update --max 3
 
 # Mirror "Next"-labeled issues to Discord threads (open on Next, archive on
-# close). Reuses the hq-github Hermes bot token.
-*/10 * * * * python3 /home/youruser/HQ/scripts/discord-issue-sync.py
+# close). Optional plugin (`hq install discord`) — a no-op if discord.* config
+# is unset.
+*/10 * * * * /hq/bin/hq discord sync
 
-# GTD daily/cleanup housekeeping (ported from GitHub Actions gtd-daily.yml /
-# gtd-cleanup.yml). Container TZ is America/New_York, so these run at local
-# 8am/2am — no more UTC/DST drift to reason about.
-0 8 * * * /home/youruser/HQ/bin/hq task cron-daily
-0 2 * * * /home/youruser/HQ/bin/hq task cron-cleanup
+# GTD daily/cleanup housekeeping.
+0 8 * * * /hq/bin/hq cron daily
+0 2 * * * /hq/bin/hq cron cleanup
+
+# NOTE: the nightly Forgejo dump backup is NOT run here. deploy/backup-forgejo.sh
+# calls `docker exec forgejo forgejo dump`, which needs the docker socket — and
+# this container deliberately does not mount it. Install the backup on the HOST
+# crontab instead (see deploy/backup-forgejo.sh header):
+#   30 3 * * * /path/to/HQ/deploy/backup-forgejo.sh

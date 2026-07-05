@@ -14,23 +14,40 @@ see hqlib/plugins/__init__.py.
 """
 import json
 import os
+import re
 from pathlib import Path
 
 from ...common import (
     fail, run, run_json, load_config, excerpt, envelope, print_json,
-    resolve_account, gws_env, owner, repo_name, forgejo_url,
+    resolve_account, gws_env, client as _client,
 )
-from ...forgejo import ForgejoClient
 
 NAME = "mail"
+
+# The email-thread ↔ issue marker convention lives here (this plugin is the
+# only thing that writes it — the triage prompt embeds it in the task body — so
+# core no longer hardcodes the regex). A task issue whose body carries
+# `<!-- email-thread:<gmail-thread-id> -->` claims that Gmail thread, so a later
+# message on the thread logs onto the issue instead of spawning a duplicate card.
+_EMAIL_THREAD_RE = re.compile(r"<!--\s*email-thread:([A-Za-z0-9_-]+)\s*-->")
+
+
+def thread_marker(thread_id):
+    """The body marker the triage step writes to bind a thread to its issue."""
+    return f"<!-- email-thread:{thread_id} -->"
+
+BIN_DEPS = ["gws"]
+
+CONFIG_STUB = {
+    "google": {
+        "default_account": "",
+        "accounts": {},  # add one entry per account, e.g. work: {config_dir: "", mail_url_index: 0}
+    },
+}
 
 
 def mail_url(url_index, message_id):
     return f"https://mail.google.com/mail/u/{url_index}/#all/{message_id}"
-
-
-def _client(cfg):
-    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
 
 
 def _gws_json(cmd, env):
@@ -59,6 +76,29 @@ def _list_unread_threads(cfg):
     ]
 
 
+def read_message(cfg, message_id, account=None, max_chars=4000):
+    """Full message fetch for the triage runner: {from,subject,date,body,url,
+    thread_id}. The body is capped so a giant email can't blow the small model's
+    context. This is the deterministic email-fetch half of triage — the model
+    only ever sees the text this returns, never a mailbox tool."""
+    _, config_dir, url_index = resolve_account(cfg, account)
+    out = run_json(
+        ["gws", "gmail", "+read", "--id", message_id, "--format", "json"],
+        env=gws_env(config_dir),
+    )
+    body = out.get("body_text") or ""
+    if len(body) > max_chars:
+        body = body[:max_chars] + "…"
+    return {
+        "from": _fmt_from(out.get("from")) or "unknown",
+        "subject": out.get("subject") or "(no subject)",
+        "date": out.get("date") or "",
+        "body": body,
+        "url": mail_url(url_index, message_id),
+        "thread_id": out.get("thread_id"),
+    }
+
+
 def _message_meta(cfg, mid):
     """{'from','subject','date','snippet','url'} for one message — used to log a
     thread evolution onto the issue."""
@@ -84,18 +124,29 @@ def _message_meta(cfg, mid):
 # Queue plugin hooks — scan() / handle_job(), see hqlib/plugins/__init__.py
 # --------------------------------------------------------------------------
 
-def scan(cfg, state, qdir, taken):
-    """New-unread-mail event detection. `enqueue`/`taken` come from core's
-    queue.py — imported lazily to avoid a load-order cycle (queue.py imports
-    this package to call scan(); this package needs queue.py's enqueue())."""
-    from ...queue import enqueue
+def _thread_index(cfg):
+    """{gmail_thread_id: issue_number} built live from Forgejo by scanning open
+    issue bodies for the thread marker. Replaces the old queue state.json
+    `email_threads` map — the mapping is derivable from Forgejo itself, so no
+    local state (and no core→plugin coupling) is needed."""
+    client = _client(cfg)
+    index = {}
+    for issue in client.list_issues(state="open"):
+        m = _EMAIL_THREAD_RE.search(issue.get("body") or "")
+        if m:
+            index[m.group(1)] = issue["number"]
+    return index
 
+
+def scan(cfg, state, q, taken):
+    """New-unread-mail event detection. `q` is the QueueClient handed in by
+    core's queue.py; `taken` is its dedup set of already-queued targets."""
     msgs = _list_unread_threads(cfg)
     seen = set(state.get("seen_message_ids", []))
     new = [m for m in msgs if m["id"] not in seen]
     if not new:
         return []
-    thread_map = state.get("email_threads", {})
+    index = _thread_index(cfg)
     ids = state.setdefault("seen_message_ids", [])
     # One job per message: a single read-classify-act decision per LLM
     # invocation is the granularity small models handle reliably.
@@ -103,16 +154,16 @@ def scan(cfg, state, qdir, taken):
     for m in new[:10]:
         mid, tid = m["id"], m.get("threadId")
         ids.append(mid)
-        issue = thread_map.get(tid) if tid else None
+        issue = index.get(tid) if tid else None
         if issue:
             # This thread already has an issue → the new message is a
             # reply/forward that evolved it. Log + refresh, don't re-triage.
             if ("thread_update", mid) not in taken:
-                created.append(enqueue(qdir, "thread_update", mid,
-                                       {"issue": issue, "message_id": mid, "thread_id": tid}))
+                created.append(q.enqueue("thread_update", mid,
+                                         {"issue": issue, "message_id": mid, "thread_id": tid}))
                 taken.add(("thread_update", mid))
         elif ("triage", mid) not in taken:
-            created.append(enqueue(qdir, "triage", mid, {"message_id": mid, "thread_id": tid}))
+            created.append(q.enqueue("triage", mid, {"message_id": mid, "thread_id": tid}))
             taken.add(("triage", mid))
     # Bound the seen list so state.json can't grow without limit.
     if len(ids) > 2000:
@@ -127,7 +178,7 @@ def handle_job(job_type, cfg, payload, log, job_name):
     (declines, falls through to the generic prompt-driven runner)."""
     if job_type != "thread_update":
         return None
-    from ...queue import queue_dir, enqueue, existing_targets
+    from ...queue import QueueClient
 
     issue = payload.get("issue")
     mid = payload.get("message_id")
@@ -146,10 +197,12 @@ def handle_job(job_type, cfg, payload, log, job_name):
     )
     client.create_comment(issue, body)
     # Refresh the dossier so it reflects the evolved thread. force=True because a
-    # new email is not a "user comment", so is_fresh() would otherwise skip it.
-    qdir = queue_dir(cfg)
-    if ("collect", str(issue)) not in existing_targets(qdir):
-        enqueue(qdir, "collect", str(issue), {"issue": issue, "force": True})
+    # new email is not a "user comment", so is_fresh() would otherwise skip it —
+    # a forced collect is filed as a standalone hq-job ticket (it must carry the
+    # force flag, which an in-place collect label can't).
+    q = QueueClient(cfg)
+    if ("collect", str(issue)) not in q.existing_targets():
+        q.enqueue("collect", str(issue), {"issue": issue, "force": True})
     log.append({"job": job_name, "issue": issue, "logged": meta["subject"]})
     return True, None
 
@@ -160,11 +213,10 @@ def handle_job(job_type, cfg, payload, log, job_name):
 
 def cmd_accounts(args):
     cfg = load_config()
-    gt = cfg.get("gmail_triage") or {}
+    gt = cfg.get("google") or {}
     print_json({
         "default_account": gt.get("default_account"),
         "accounts": gt.get("accounts", {}),
-        "inbox_label": gt.get("inbox_label"),
     })
 
 
@@ -373,7 +425,7 @@ def register(sub):
     s.add_argument("--preview-chars", dest="preview_chars", type=int, default=400)
     s.set_defaults(func=cmd_brief)
 
-    s = s2.add_parser("read", help="read a message by ID (body capped; --full for everything)")
+    s = s2.add_parser("show", help="show a message by ID (body capped; --full for everything)")
     s.add_argument("message_id")
     s.add_argument("--account")
     s.add_argument("--max-chars", dest="max_chars", type=int, default=2000)

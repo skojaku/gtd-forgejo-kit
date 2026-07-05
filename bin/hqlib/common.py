@@ -66,7 +66,7 @@ def config_path():
     override = os.environ.get("HQ_ENV")
     if override:
         return Path(override).expanduser()
-    return repo_root() / "config" / "env.yaml"
+    return repo_root() / "config" / "hq.yaml"
 
 
 def _parse_yaml(path):
@@ -96,19 +96,6 @@ def load_config():
     cfg = _parse_yaml(path)
     if not isinstance(cfg, dict):
         fail(f"{path} did not parse to a mapping")
-    # Committed public identifiers (owner/repo/forgejo_url) override env.yaml
-    # so they live in exactly one tracked place.
-    proj_path = repo_root() / "config" / "project.yaml"
-    if proj_path.exists():
-        proj = _parse_yaml(proj_path) or {}
-        cfg.setdefault("user", {})
-        cfg.setdefault("repo", {})
-        if proj.get("owner"):
-            cfg["user"]["username"] = proj["owner"]
-        if proj.get("repo"):
-            cfg["repo"]["name"] = proj["repo"]
-        if proj.get("forgejo_url"):
-            cfg["forgejo_url"] = proj["forgejo_url"]
     _CONFIG_CACHE = cfg
     return cfg
 
@@ -117,7 +104,7 @@ def owner(cfg):
     """Forgejo/repo owner login. Override: $HQ_OWNER."""
     v = os.environ.get("HQ_OWNER") or (cfg.get("user") or {}).get("username")
     if not v:
-        fail("config is missing user.username (or config/project.yaml owner, or $HQ_OWNER)")
+        fail("config is missing user.username (or $HQ_OWNER)")
     return v
 
 
@@ -126,7 +113,7 @@ def repo(cfg):
     bare name Forgejo API paths need (see repo_name())."""
     v = (cfg.get("repo") or {}).get("name")
     if not v:
-        fail("config is missing repo.name (or config/project.yaml repo)")
+        fail("config is missing repo.name")
     return v
 
 
@@ -140,12 +127,21 @@ def repo_name(cfg):
 
 
 def forgejo_url(cfg):
-    """Base URL of the Forgejo instance, e.g. http://forgejo.example.com:3000.
+    """Base URL of the Forgejo instance, e.g. http://forgejo:3000.
     Override: $FORGEJO_URL."""
     v = os.environ.get("FORGEJO_URL") or cfg.get("forgejo_url")
     if not v:
-        fail("config is missing project.yaml forgejo_url (or $FORGEJO_URL)")
+        fail("config is missing forgejo_url (or $FORGEJO_URL)")
     return v.rstrip("/")
+
+
+def client(cfg):
+    """Shared ForgejoClient factory — the single construction point for the
+    REST client, used by core (task/queue/dossier) and the mail/discord
+    plugins so the (url, owner, repo) wiring lives in exactly one place.
+    Imported lazily to keep this module free of a hard forgejo dependency."""
+    from .forgejo import ForgejoClient
+    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +162,7 @@ def resolve_account(cfg, name):
     {config_dir, mail_url_index}. An empty config_dir means "use gws's own
     default" (single-account host).
     """
-    gt = cfg.get("gmail_triage") or {}
+    gt = cfg.get("google") or {}
     accounts = gt.get("accounts", {})
     key = name or gt.get("default_account")
     if not key or key not in accounts:

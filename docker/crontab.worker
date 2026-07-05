@@ -1,13 +1,14 @@
-# HQ local-worker container crontab — executed by supercronic inside the
-# hq-worker service (same image as the master's hq container, HQ_ROLE=worker
-# so entrypoint.sh skips the Hermes gateway). This is the master machine's
-# own lower-priority collect worker, symmetric with a remote worker
-# (scripts/hq-runner.sh) except it runs locally instead of over ssh.
+# HQ worker jobs — run by supercronic inside the hq-worker service.
+# 5-field cron syntax (m h dom mon dow); no user column. Paths are relative to
+# the bind-mounted repo at /hq.
 #
-# master-local-worker.sh only actually claims a job when (1) a collect job
-# has waited >20m in pending AND (2) this machine's GPUs are free — so it
-# stays out of the way while remote workers are keeping up. See the script
-# for the full gating logic.
+# The worker claims heavy collect jobs and runs them through hermes against the
+# ollama endpoint (http://ollama:11434). It does NOT scan or triage — that is
+# the hq-cron container's job. Keeping the tree current is the only shared
+# concern, so it runs its own low-frequency pull.
 
-*/5  * * * * git -C /home/youruser/HQ pull --rebase --autostash origin main
-*/5  * * * * /home/youruser/HQ/scripts/master-local-worker.sh
+# Keep the working tree current.
+*/5  * * * * git -C /hq pull --rebase --autostash origin main
+
+# Claim and run pending collect jobs (hermes + the large local model).
+*/2  * * * * /hq/bin/hq queue work --types collect --max 1

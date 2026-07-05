@@ -12,6 +12,6 @@ Drafts only: this CLI **cannot send email** — `hq mail draft-reply` and `hq ma
 Guidance:
 - Prefer `hq mail find` with structured flags (`--from`, `--subject`, `--text`, `--newer-than`) over broad scans — one precise query beats many wide ones.
 - `hq mail brief` is the one-shot triage input: unread messages hydrated with previews.
-- `hq mail read <id>` caps the body; add `--full` only when the capped body is genuinely not enough.
+- `hq mail show <id>` caps the body; add `--full` only when the capped body is genuinely not enough.
 - Search results include a clickable `url` per message — use it whenever you cite an email.
 - Draft tone: follow `scripts/prompts/email-style.md`.

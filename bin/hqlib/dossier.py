@@ -1,6 +1,6 @@
-"""hq task brief / dossier — the collect-loop bookends.
+"""hq task context / dossier — the collect-loop bookends.
 
-`brief` gives the model everything needed to start a collect run in one call:
+`context` gives the model everything needed to start a collect run in one call:
 issue content, project fields, the last dossier, and the user comments posted
 since it (those comments are the user's standing instructions).
 
@@ -13,18 +13,13 @@ Marker (first line of every agent comment, invisible in the Forgejo UI):
 from datetime import datetime, timezone
 
 from .common import (
-    fail, load_config, owner, repo_name, forgejo_url,
+    fail, load_config, owner, client as _client,
     excerpt, print_json, read_params,
 )
-from .forgejo import ForgejoClient
 
 MARKER_PREFIX = "<!-- hq-dossier v1"
 VALID_SOURCES = ("gmail", "drive", "wiki", "calendar")
 NEEDS_DECISION_LABEL = "needs-decision"
-
-
-def _client(cfg):
-    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
 
 
 def _fetch_issue_and_comments(cfg, issue):
@@ -193,7 +188,7 @@ def cmd_dossier(args):
 
 
 def register(sub):
-    s = sub.add_parser("brief", help="everything needed to start a collect run: issue + fields + last dossier + new user comments")
+    s = sub.add_parser("context", help="everything needed to start a collect run: issue + fields + last dossier + new user comments")
     s.add_argument("issue", type=int)
     s.set_defaults(func=cmd_brief)
 

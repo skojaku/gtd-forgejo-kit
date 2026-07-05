@@ -1,101 +1,98 @@
 #!/usr/bin/env bash
-# hermes-setup.sh — ensure GitHub HQ's isolated Hermes profiles exist.
+# hermes-setup.sh — create/refresh HQ's isolated Hermes profile ("hq-local").
 # Idempotent; safe to re-run.
 #
-# IMPORTANT: this script does NOT touch ~/.hermes/config.yaml. That file belongs
-# to the always-on host gateway (hermes-gateway.service) and defines the DEFAULT
-# profile + brain, which is now Discord-ONLY. GitHub HQ runs are FULLY SEPARATED
-# onto their own profiles, each with its own brain:
-#   * hq-github — non-protected GitHub issues. LOCAL qwen3.6:27b, own brain.
-#   * protected — protected-data issues. LOCAL qwen, own brain; data never reaches
-#                 a cloud endpoint and never lands in any other brain.
-# Separating these means changing the gateway's model/config/brain never affects
-# GitHub runs, and vice versa.
+# HQ runs Hermes for its agentic jobs (collect dossiers, the Discord gateway) on
+# ONE dedicated profile, "hq-local", pinned to a LOCAL ollama model. This keeps
+# GTD data on the tailnet — it never reaches a cloud endpoint. The profile is
+# fully separated from any other Hermes config on the host: changing another
+# profile's model/brain never affects HQ runs, and vice versa.
 #
-# It drives the `hermes` binary inside hq-container, writing into the host's
-# bind-mounted ~/.hermes with the correct ownership.
+# This does NOT touch ~/.hermes/config.yaml (the host default profile). It only
+# writes ~/.hermes/profiles/hq-local/. It drives the `hermes` binary inside the
+# hq-container image so the files land with the right ownership in the host's
+# bind-mounted ~/.hermes.
 #
-# Prereq: Hermes must already be set up on the host (config.yaml present), which
-# it is once the gateway has been configured. Usage:  ./scripts/hermes-setup.sh
+# Prereq: Hermes set up on the host (~/.hermes/config.yaml present) and the
+# hq-container image built. Usage:  ./scripts/hermes-setup.sh
 set -euo pipefail
 
 HERMES_DIR="${HOME}/.hermes"
 IMAGE="hq-container"
-OLLAMA_URL="http://localhost:11434/v1"   # local ollama — serves local + cloud models
+PROFILE="hq-local"
+MODEL="qwen3.6:27b"                          # collect/discord local model (27B)
+# ollama's compose service DNS; the OpenAI-compatible endpoint hermes talks to.
+OLLAMA_URL="${OLLAMA_URL:-http://ollama:11434}/v1"
+# Docker network for the container that drives hermes. The profile-writing calls
+# don't need ollama, so they default to the host network; the smoke test needs
+# to reach ollama, so run this script with HQ_NETWORK set to your compose
+# network (e.g. HQ_NETWORK=hq_hq ./scripts/hermes-setup.sh) to exercise it.
+HQ_NETWORK="${HQ_NETWORK:-host}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOUL_TEMPLATE="$REPO_ROOT/docker/hermes-hq-soul.md"   # committed collector contract
 
 if [[ ! -f "$HERMES_DIR/config.yaml" ]]; then
   echo "ERROR: $HERMES_DIR/config.yaml not found." >&2
-  echo "Set up Hermes / the gateway on the host first; this script only adds the" >&2
-  echo "GitHub HQ profiles and refuses to create a default config from scratch." >&2
+  echo "Set up Hermes on the host first (hermes setup); this script only adds the" >&2
+  echo "hq-local profile and refuses to create a default config from scratch." >&2
   exit 1
 fi
 
+# Drive hermes inside the image, HOME=/home/hq and the repo at /hq (matching
+# deploy/compose.yaml), writing into the host-bind-mounted ~/.hermes.
 run_hermes() {
-  docker run --rm --network host \
+  docker run --rm --network "$HQ_NETWORK" \
     --user "$(id -u):$(id -g)" \
-    -e HOME=$HOME \
-    -v "$HERMES_DIR:$HOME/.hermes" \
+    -e HOME=/home/hq \
+    -v "$HERMES_DIR:/home/hq/.hermes" \
+    -v "$REPO_ROOT:/hq" \
     --entrypoint hermes "$IMAGE" "$@"
 }
 
-# ensure_profile <name> <local-model> [discord] — create the profile (if
-# missing) and pin it to a LOCAL model with its own brain, isolated from the
-# gateway's default. Pass "discord" as the 3rd arg to also write a Discord
-# adapter block (bot token/access policy still come from the profile's own
-# .env — never written by this script).
-ensure_profile() {
-  local name="$1" model="$2" want_discord="${3:-}"
-  echo "→ Ensuring isolated '$name' profile exists..."
-  if ! run_hermes profile list 2>/dev/null | grep -qw "$name"; then
-    run_hermes profile create "$name"
-  else
-    echo "  (already exists)"
-  fi
+echo "→ Ensuring isolated '$PROFILE' profile exists..."
+if ! run_hermes profile list 2>/dev/null | grep -qw "$PROFILE"; then
+  run_hermes profile create "$PROFILE"
+else
+  echo "  (already exists)"
+fi
 
-  echo "→ Pinning '$name' profile to LOCAL model '$model' (never a :cloud endpoint)..."
-  mkdir -p "$HERMES_DIR/profiles/$name/memories"
-  {
-    cat <<EOF
-# Managed by scripts/hermes-setup.sh — '$name' brain. LOCAL-ONLY:
-# GitHub HQ data must never be routed to a cloud endpoint.
+echo "→ Pinning '$PROFILE' to LOCAL model '$MODEL' (never a cloud endpoint)..."
+mkdir -p "$HERMES_DIR/profiles/$PROFILE/memories"
+cat > "$HERMES_DIR/profiles/$PROFILE/config.yaml" <<EOF
+# Managed by scripts/hermes-setup.sh — the 'hq-local' brain. LOCAL-ONLY:
+# HQ/GTD data must never be routed to a cloud endpoint.
 model:
-  default: "$model"
+  default: "$MODEL"
   provider: "ollama"
   base_url: "$OLLAMA_URL"
   api_key: "ollama"
-# Skill sources beyond the builtins — the global cross-project skills
-# (find-skills, gws-calendar, gws-gmail, ...) plus this repo's own skills
-# (task, mail, cal, drive, collect, triage, wiki via .claude/skills symlinks).
-# Both are bind-mounted into the container by docker-compose; this just makes
-# Hermes look there. NOT $HOME/HQ/skills (removed) or the whole repo.
+# Skill sources beyond the builtins: the global cross-project skills under
+# ~/.agents/skills (mounted at /home/hq/.agents) plus this repo's own skills
+# (task, mail, cal, drive, collect, triage, wiki) under /hq/.claude/skills. Both
+# are bind-mounted by deploy/compose.yaml; this just points hermes at them.
 skills:
   external_dirs:
-    - $HOME/.agents/skills
-    - $HOME/HQ/.claude/skills
-# Tool shells run the hq CLI, which must start in the repo and reach the host's
-# Google Workspace creds. Hermes sandboxes tool env, so without this a
-# profile-scoped HOME makes ~/HQ resolve to a bogus path. Pin cwd to the repo
-# and pass through the non-secret vars. NOTE: FORGEJO_TOKEN cannot be passed here —
-# hermes hard-blocks env secrets passed to sandboxed tool shells (see
-# GHSA-rhgp-j443-p4rf for the GH_TOKEN case this also applies to); the agent's
-# `hq` CLI authenticates via the ~/.config/hq/forgejo-token file instead
-# (mounted read-only by the compose file — see deploy/compose.example.yaml).
+    - /home/hq/.agents/skills
+    - /hq/.claude/skills
+# Tool shells run the hq CLI, which must start in the repo (/hq) and reach the
+# host's Google Workspace creds and the Forgejo token. Hermes sandboxes tool
+# env, so pin cwd to the repo and pass through the non-secret vars. The Forgejo
+# token comes from FORGEJO_TOKEN (from .env) or ~/.config/hq/forgejo-token
+# (mounted read-only) — the same two ways forgejo.py resolves it. No gh: HQ
+# talks to Forgejo over its API, not the GitHub CLI.
 terminal:
-  cwd: $HOME/HQ
+  cwd: /hq
   env_passthrough:
     - HOME
     - PATH
     - TZ
-    - GH_CONFIG_DIR
+    - FORGEJO_URL
+    - FORGEJO_TOKEN
     - GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND
     - GOOGLE_WORKSPACE_CLI_CONFIG_DIR
-EOF
-    if [[ "$want_discord" == "discord" ]]; then
-      cat <<'EOF'
-# Discord adapter — bot token + access policy (GATEWAY_ALLOW_ALL_USERS or
-# DISCORD_ALLOWED_USERS) live in this profile's .env, not here.
+# Discord adapter — the bot token + access policy (GATEWAY_ALLOW_ALL_USERS or
+# DISCORD_ALLOWED_USERS) live in this profile's .env, not here. Consumed by the
+# hq-discord compose service (hermes -p hq-local gateway run).
 discord:
   require_mention: false
   free_response_channels: ''
@@ -106,45 +103,44 @@ discord:
   history_backfill_limit: 50
   reactions: true
 EOF
-    fi
-  } > "$HERMES_DIR/profiles/$name/config.yaml"
 
-  # Seed the system prompt (SOUL.md) from the committed collector contract so
-  # the gateway drives `hq` and respects the collector boundaries (Inbox+drafts
-  # only; never send/book/close). Overwritten on every run — the authoritative
-  # copy lives in git, not the host brain.
-  if [[ -f "$SOUL_TEMPLATE" ]]; then
-    echo "→ Installing HQ collector contract into '$name' SOUL.md..."
-    cp "$SOUL_TEMPLATE" "$HERMES_DIR/profiles/$name/SOUL.md"
-  else
-    echo "  ⚠ SOUL template not found at $SOUL_TEMPLATE — skipping"
-  fi
+# Seed SOUL.md from the committed collector contract so the agent drives `hq`
+# and respects the collector boundaries (Inbox + drafts only; never send/book/
+# close). Overwritten every run — the authoritative copy lives in git.
+if [[ -f "$SOUL_TEMPLATE" ]]; then
+  echo "→ Installing HQ collector contract into '$PROFILE' SOUL.md..."
+  cp "$SOUL_TEMPLATE" "$HERMES_DIR/profiles/$PROFILE/SOUL.md"
+else
+  echo "  ⚠ SOUL template not found at $SOUL_TEMPLATE — skipping"
+fi
 
-  echo "→ Smoke test ('$name' brain, local model)..."
-  if run_hermes -p "$name" -z "Reply with exactly: ${name}-ready" 2>/dev/null | grep -q "${name}-ready"; then
-    echo "  ✓ $name brain OK"
-  else
-    echo "  ⚠ ${name}-brain smoke test failed — check the local model '$model' in ollama"
-  fi
-}
-
-ensure_profile hq-github qwen3.6:27b discord
-ensure_profile protected qwen3.6:35b-a3b
+echo "→ Smoke test ('$PROFILE' brain, local model)..."
+if run_hermes -p "$PROFILE" -z "Reply with exactly: ${PROFILE}-ready" 2>/dev/null | grep -q "${PROFILE}-ready"; then
+  echo "  ✓ $PROFILE brain OK"
+else
+  echo "  ⚠ ${PROFILE}-brain smoke test failed. If HQ_NETWORK is 'host', hermes"
+  echo "    can't reach ollama:11434 — re-run with HQ_NETWORK=<compose-network>"
+  echo "    (e.g. HQ_NETWORK=hq_hq), and confirm model '$MODEL' is pulled in ollama."
+fi
 
 cat <<EOF
 
-GitHub HQ profiles ready (fully separated from the Discord gateway).
-  Discord gateway brain (untouched) : $HERMES_DIR/memories/MEMORY.md   (DEFAULT profile — gateway only)
-  GitHub HQ brain (non-protected)   : $HERMES_DIR/profiles/hq-github/memories/MEMORY.md   (local qwen3.6:27b)
-  GitHub protected brain            : $HERMES_DIR/profiles/protected/memories/MEMORY.md   (local qwen, isolated)
+Hermes 'hq-local' profile ready (isolated, LOCAL model '$MODEL').
+  Brain (memory) : $HERMES_DIR/profiles/$PROFILE/memories/MEMORY.md
+  Contract       : $HERMES_DIR/profiles/$PROFILE/SOUL.md
+  Model endpoint : $OLLAMA_URL  (ollama)
 
-Discord: 'hq-github' is fronted by the 'hq-agent' docker-compose service
-(hermes -p hq-github gateway run). Before 'docker compose up -d hq-agent':
-  1. Create a bot at https://discord.com/developers/applications, invite it
-     to your server, enable MESSAGE CONTENT intent.
-  2. echo "DISCORD_BOT_TOKEN=<token>" >> $HERMES_DIR/profiles/hq-github/.env
+Used by:
+  * collect jobs  — 'hq queue work --types collect' shells 'hermes -z -p $PROFILE'.
+  * Discord       — the opt-in 'hq-discord' compose service
+                    ('docker compose --profile discord up -d').
+
+Before starting hq-discord:
+  1. Create a bot at https://discord.com/developers/applications, invite it to
+     your server, and enable the MESSAGE CONTENT intent.
+  2. echo "DISCORD_BOT_TOKEN=<token>" >> $HERMES_DIR/profiles/$PROFILE/.env
   3. Access policy — either:
-       echo "GATEWAY_ALLOW_ALL_USERS=true" >> $HERMES_DIR/profiles/hq-github/.env
+       echo "GATEWAY_ALLOW_ALL_USERS=true" >> $HERMES_DIR/profiles/$PROFILE/.env
      or
-       echo "DISCORD_ALLOWED_USERS=id1,id2" >> $HERMES_DIR/profiles/hq-github/.env
+       echo "DISCORD_ALLOWED_USERS=id1,id2" >> $HERMES_DIR/profiles/$PROFILE/.env
 EOF

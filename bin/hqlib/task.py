@@ -15,18 +15,13 @@ subcommands and the same JSON shapes as the old gh/GraphQL implementation.
 from datetime import date
 
 from .common import (
-    fail, load_config, owner, repo_name, forgejo_url,
+    fail, load_config, owner, repo_name, forgejo_url, client as _client,
     read_meta, write_meta, envelope, print_json, read_params, is_valid_date,
     config_path,
 )
-from .forgejo import ForgejoClient
 
 STATUS_VALUES = ("inbox", "next", "review", "done", "deferred", "waiting", "someday")
 CONTEXT_VALUES = ("computer", "writing", "errands", "calls", "reading")
-
-
-def _client(cfg):
-    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
 
 
 def _norm_status(value):
@@ -83,7 +78,15 @@ def _task_from_issue(issue_data):
 
 def fetch_tasks(cfg):
     client = _client(cfg)
-    return [_task_from_issue(i) for i in client.list_issues(state="all")]
+    # Skip `hq-job` tickets: the queue files triage/thread_update jobs as
+    # standalone issues (see hqlib/queue.py), which are automation plumbing, not
+    # GTD tasks — they must never appear in task lists, summaries, or the cron
+    # sweeps that iterate fetch_tasks().
+    return [
+        _task_from_issue(i)
+        for i in client.list_issues(state="all")
+        if not any(l["name"] == "hq-job" for l in (i.get("labels") or []))
+    ]
 
 
 def find_task(cfg, issue):
@@ -238,7 +241,7 @@ def cmd_update(args):
             fail(
                 "cannot move to Next: Duration and Booked must both be set. "
                 f"duration={final_duration!r} booked={final_booked!r}. "
-                "Set 'duration' and 'booked' in this same update, or run 'hq cal book' first."
+                "Set 'duration' and 'booked' in this same update."
             )
 
     for key in ("due", "defer", "scheduled", "booked"):
@@ -328,32 +331,6 @@ def cmd_update(args):
     print_json(updated)
 
 
-def cmd_done(args):
-    cfg = load_config()
-    client = _client(cfg)
-    _require_issue(cfg, args.issue)
-    client.replace_scoped(args.issue, "status", "done")
-    client.edit_issue(args.issue, state="closed")
-    print_json({"issue": args.issue, "status": "Done", "closed": True})
-
-
-def cmd_defer(args):
-    cfg = load_config()
-    if not is_valid_date(args.until):
-        fail(f"'until' must be YYYY-MM-DD, got: {args.until}")
-    client = _client(cfg)
-    issue_data, current = _require_issue(cfg, args.issue)
-    merged_meta = {
-        "defer": args.until,
-        "scheduled": current["scheduled"],
-        "duration": current["duration"],
-        "booked": current["booked"],
-    }
-    client.edit_issue(args.issue, body=write_meta(issue_data.get("body") or "", merged_meta))
-    client.replace_scoped(args.issue, "status", "deferred")
-    print_json({"issue": args.issue, "status": "Deferred", "defer": args.until})
-
-
 def cmd_comment(args):
     cfg = load_config()
     client = _client(cfg)
@@ -389,16 +366,9 @@ def cmd_summary(args):
 # Cron commands (ports of the old gtd-daily.yml / gtd-cleanup.yml workflows)
 # --------------------------------------------------------------------------
 
-def _today(args):
-    today = args.today or date.today().isoformat()
-    if not is_valid_date(today):
-        fail(f"--today must be YYYY-MM-DD, got: {today}")
-    return today
-
-
 def cmd_cron_daily(args):
     cfg = load_config()
-    today = _today(args)
+    today = date.today().isoformat()
     client = _client(cfg)
     tasks = fetch_tasks(cfg)
     actions = []
@@ -440,7 +410,7 @@ def cmd_cron_daily(args):
 
 def cmd_cron_cleanup(args):
     cfg = load_config()
-    today = _today(args)
+    today = date.today().isoformat()
     client = _client(cfg)
     tasks = fetch_tasks(cfg)
     actions = []
@@ -490,15 +460,6 @@ def register(sub):
     s.add_argument("file")
     s.set_defaults(func=cmd_update)
 
-    s = s2.add_parser("done", help="mark done and close the issue")
-    s.add_argument("issue", type=int)
-    s.set_defaults(func=cmd_done)
-
-    s = s2.add_parser("defer", help="defer until a date")
-    s.add_argument("issue", type=int)
-    s.add_argument("until", help="YYYY-MM-DD")
-    s.set_defaults(func=cmd_defer)
-
     s = s2.add_parser("comment", help="add a plain comment to the issue")
     s.add_argument("issue", type=int)
     s.add_argument("text")
@@ -510,16 +471,6 @@ def register(sub):
     pa = proj_sub.add_parser("add")
     pa.add_argument("name")
     pa.set_defaults(func=cmd_projects_add)
-
-    s = s2.add_parser("cron-daily", help="daily un-defer / schedule sweep (cron)")
-    s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--today", help="override today's date YYYY-MM-DD (testing)")
-    s.set_defaults(func=cmd_cron_daily)
-
-    s = s2.add_parser("cron-cleanup", help="close status/done issues; label closed issues done (cron)")
-    s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--today", help="override today's date YYYY-MM-DD (testing)")
-    s.set_defaults(func=cmd_cron_cleanup)
 
     # brief/dossier live in dossier.py but hang off `hq task`
     from . import dossier

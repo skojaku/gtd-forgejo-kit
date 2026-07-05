@@ -1,6 +1,6 @@
 """forgejo.py — stdlib-only REST client for the self-hosted Forgejo instance.
 
-Mirrors the house style of the Discord class in scripts/discord-issue-sync.py:
+Mirrors the house style of the _Discord class in hqlib/plugins/discord/:
 plain `urllib.request`, a thin `_req` wrapper that builds the request, adds
 auth, retries transient failures, and raises a clear `RuntimeError` with the
 HTTP status + response body on hard failures.
@@ -27,6 +27,15 @@ TOKEN_FILE = Path(os.path.expanduser("~/.config/hq/forgejo-token"))
 MAX_ATTEMPTS = 3
 BACKOFF_BASE = 1.5  # seconds; attempt N sleeps BACKOFF_BASE * N
 
+# Default scopes for a token minted by `hq setup` — enough to drive the whole
+# GTD workflow (repos, issues, labels, comments) and read the owning user, but
+# no admin/sudo. Forgejo's coarse read/write scope model, newest naming.
+SETUP_TOKEN_SCOPES = [
+    "write:repository",
+    "write:issue",
+    "write:user",
+]
+
 
 def load_token() -> str:
     """$FORGEJO_TOKEN wins; else the mounted token file. Raises if neither is set."""
@@ -39,6 +48,93 @@ def load_token() -> str:
             return tok
     raise RuntimeError(
         f"no Forgejo token: set $FORGEJO_TOKEN or create {TOKEN_FILE} (mode 600)"
+    )
+
+
+def save_token(token: str) -> Path:
+    """Persist a token to ~/.config/hq/forgejo-token (mode 600). Returns the path.
+    Used by `hq setup` after minting a token so interactive hosts pick it up via
+    load_token() without an env var."""
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token.strip() + "\n")
+    os.chmod(TOKEN_FILE, 0o600)
+    return TOKEN_FILE
+
+
+# --------------------------------------------------------------------------
+# Greenfield bootstrap helpers (used by `hq setup` Tier 2). These talk to a
+# fresh Forgejo with HTTP Basic auth (admin username/password) rather than a
+# token, since on a greenfield instance no token exists yet.
+# --------------------------------------------------------------------------
+
+def _basic_auth_header(user: str, password: str) -> str:
+    import base64
+    raw = f"{user}:{password}".encode()
+    return "Basic " + base64.b64encode(raw).decode()
+
+
+def _plain_req(url: str, method: str = "GET", payload=None, headers=None,
+               timeout: int = 15):
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "hq-forgejo-client (HQ setup, 1.0)")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        raise RuntimeError(f"forgejo {method} {url} -> {e.code}: {detail[:500]}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"forgejo {method} {url}: {e}") from None
+
+
+def reachable(base_url: str, timeout: int = 5) -> dict:
+    """Unauthenticated GET /api/v1/version — confirms the instance is up and
+    speaking the API, independent of any token. Returns the version dict or
+    raises RuntimeError. Used by `hq doctor`."""
+    return _plain_req(
+        f"{base_url.rstrip('/')}/api/v1/version", timeout=timeout
+    )
+
+
+def create_token(base_url: str, username: str, password: str, name: str,
+                 scopes: list | None = None) -> str:
+    """Mint a personal access token via Basic auth (POST /users/{u}/tokens).
+    Returns the raw sha1 token string. Raises if the name already exists."""
+    data = _plain_req(
+        f"{base_url.rstrip('/')}/api/v1/users/{username}/tokens",
+        method="POST",
+        payload={"name": name, "scopes": scopes or SETUP_TOKEN_SCOPES},
+        headers={"Authorization": _basic_auth_header(username, password)},
+    )
+    tok = data.get("sha1") or data.get("token")
+    if not tok:
+        raise RuntimeError(f"token created but no sha1 in response: {data}")
+    return tok
+
+
+def create_admin_user(base_url: str, admin_user: str, admin_password: str,
+                      username: str, password: str, email: str,
+                      admin: bool = True) -> dict:
+    """Create a user via the admin API (POST /admin/users) using an existing
+    admin's Basic-auth credentials. On a greenfield instance the first admin is
+    made by the Forgejo web installer or `forgejo admin user create`; this is
+    for scripting additional (or the working) accounts once one admin exists."""
+    return _plain_req(
+        f"{base_url.rstrip('/')}/api/v1/admin/users",
+        method="POST",
+        payload={
+            "username": username,
+            "password": password,
+            "email": email,
+            "must_change_password": False,
+            "admin": admin,
+        },
+        headers={"Authorization": _basic_auth_header(admin_user, admin_password)},
     )
 
 
@@ -65,7 +161,7 @@ class ForgejoClient:
         req = urllib.request.Request(url, data=body, method=method)
         req.add_header("Authorization", f"token {self.token}")
         req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "hq-forgejo-client (see README, 1.0)")
+        req.add_header("User-Agent", "hq-forgejo-client/1.0")
 
         last_err = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -95,6 +191,58 @@ class ForgejoClient:
     def _repo_path(self, suffix: str = "") -> str:
         return f"/repos/{self.owner}/{self.repo}{suffix}"
 
+    # -- identity / bootstrap ---------------------------------------------
+    def whoami(self) -> dict:
+        """GET /user — resolves the token to its owning account. Doubles as the
+        token-validity probe for `hq doctor` (raises on a bad/expired token)."""
+        return self._req("GET", "/user")
+
+    def repo_exists(self) -> bool:
+        try:
+            self._req("GET", self._repo_path())
+            return True
+        except RuntimeError as e:
+            if "-> 404" in str(e):
+                return False
+            raise
+
+    def ensure_repo(self, private: bool = True, description: str = "",
+                    auto_init: bool = True) -> dict:
+        """Create owner/repo if it doesn't exist yet (POST /user/repos, which
+        creates under the token's own account). Idempotent: returns
+        {'created': bool, 'repo': <name>}."""
+        if self.repo_exists():
+            return {"created": False, "repo": f"{self.owner}/{self.repo}"}
+        self._req(
+            "POST", "/user/repos",
+            payload={
+                "name": self.repo,
+                "private": private,
+                "description": description,
+                "auto_init": auto_init,
+            },
+        )
+        return {"created": True, "repo": f"{self.owner}/{self.repo}"}
+
+    def ensure_labels(self, labels: list) -> dict:
+        """Idempotent bulk label create. `labels` is a list of
+        (name, color, exclusive) tuples. Returns {'created': [...], 'skipped': [...]}."""
+        existing = {l["name"] for l in self.list_labels()}
+        created, skipped = [], []
+        for name, color, exclusive in labels:
+            if name in existing:
+                skipped.append(name)
+                continue
+            try:
+                self.create_label(name, color, exclusive=exclusive)
+                created.append(name)
+            except RuntimeError as e:
+                if "already exists" in str(e).lower():
+                    skipped.append(name)
+                else:
+                    raise
+        return {"created": created, "skipped": skipped}
+
     # -- issues -----------------------------------------------------------
     def list_issues(self, state: str = "all", labels: str | None = None, since: str | None = None) -> list[dict]:
         """Paginated walk of all issues (type=issues excludes PRs).
@@ -123,6 +271,12 @@ class ForgejoClient:
 
     def get_issue(self, number: int) -> dict:
         return self._req("GET", self._repo_path(f"/issues/{number}"))
+
+    def issue_labels(self, number: int) -> list[str]:
+        """Current label names on an issue — used by the queue's atomic claim to
+        re-read who actually holds a job after an exclusive-label swap."""
+        data = self.get_issue(number)
+        return [l["name"] for l in (data.get("labels") or [])]
 
     def create_issue(self, title: str, body: str = "", labels: list[str] | None = None) -> dict:
         payload = {"title": title, "body": body}

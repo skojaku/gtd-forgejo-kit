@@ -9,12 +9,12 @@ Goal: give the user everything they need to act on a task, as clickable sources 
 
 Follow these steps exactly, one command each:
 
-1. **Brief.** `hq task brief <issue>` — read the title, body, fields, last dossier, and `user_comments_since`. Treat the user's comments as directives (what to look for, what to skip).
+1. **Context.** `hq task context <issue>` — read the title, body, fields, last dossier, and `user_comments_since`. Treat the user's comments as directives (what to look for, what to skip).
    - If `last_dossier` is under 3 days old AND `user_comments_since` is empty, stop: reply that the dossier is current. Post nothing.
 
 2. **Search mail.** Up to 2 precise queries: `hq mail find --text "<key terms>" --newer-than 6m --max 5` (or `--from` when a person is named). Pick the relevant hits.
 
-3. **Search drive.** Up to 2 queries: `hq drive find --text "<key terms>" --max 5`. For the single most relevant Google Doc, optionally `hq drive excerpt <id> --query "<term>"`.
+3. **Search drive.** Up to 2 queries: `hq drive find --text "<key terms>" --max 5`. For the single most relevant Google Doc, optionally `hq drive show <id> --query "<term>"`.
 
 4. **Search wiki.** Up to 2 queries: `hq wiki find "<key terms>" --max 5`.
 

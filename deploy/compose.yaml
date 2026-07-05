@@ -1,0 +1,115 @@
+# HQ server stack — tracked and fully parameterized. No author-specific values
+# live here; everything host-specific comes from the repo-root .env (copy
+# .env.example -> .env and fill it in). Run from the repo root, e.g.:
+#
+#   docker compose -f deploy/compose.yaml up -d                     # default: forgejo + ollama + hq-cron
+#   docker compose -f deploy/compose.yaml --profile worker up -d    # + collect worker
+#   docker compose -f deploy/compose.yaml --profile discord up -d   # + Discord gateway
+#
+# One bridge network "hq"; services reach each other by name
+# (http://forgejo:3000, http://ollama:11434). No network_mode: host, no
+# docker.sock mounts, no DooD GPU hack — the ollama service owns the GPU.
+name: hq
+
+# Shared config for the three services built from this repo's image.
+x-hq-common: &hq-common
+  build:
+    context: ..                # repo root, where the Dockerfile lives
+    args:
+      UID: ${UID}
+      GID: ${GID}
+  image: hq-container
+  user: "${UID}:${GID}"
+  restart: unless-stopped
+  env_file: ../.env
+  environment:
+    HOME: /home/hq
+    TZ: ${TZ}
+    FORGEJO_URL: http://forgejo:3000   # reach forgejo by service name on the bridge
+    GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND: file
+    GOOGLE_WORKSPACE_CLI_CONFIG_DIR: /home/hq/.config/gws
+  networks: [hq]
+  volumes:
+    - ..:/hq                                       # the repo, bind-mounted
+    - ~/.config/gws:/home/hq/.config/gws
+    - ~/.config/hq:/home/hq/.config/hq:ro
+    - ~/.agents:/home/hq/.agents:ro
+    - ~/.hermes:/home/hq/.hermes
+    - ~/.email-triage:/home/hq/.email-triage
+
+services:
+  # Git host + issues = GTD state + job queue. Binds loopback + your private
+  # network only (${HQ_BIND_IP}). NEVER 0.0.0.0 — this holds all your data.
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    container_name: forgejo
+    restart: always
+    environment:
+      # Forgejo's INTERNAL git user, not the host UID. 1000 is the Forgejo image
+      # default and what existing /data is owned by — do not tie this to ${UID}.
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__server__DOMAIN=${HQ_DOMAIN}
+      - FORGEJO__server__ROOT_URL=http://${HQ_DOMAIN}:3000/
+      - FORGEJO__service__DISABLE_REGISTRATION=true
+      - FORGEJO__security__INSTALL_LOCK=true
+      - FORGEJO__database__DB_TYPE=sqlite3
+    volumes:
+      - forgejo-data:/data
+      - /etc/localtime:/etc/localtime:ro
+    # HTTP only — HQ does all git over HTTPS+token, so SSH-git (port 22/222) is
+    # not published. Add a '…:222:22' mapping here if you want git-over-ssh.
+    ports:
+      - '127.0.0.1:3000:3000'
+      - '${HQ_BIND_IP}:3000:3000'
+    networks: [hq]
+
+  # Local models. GPU via the nvidia container toolkit; comment the deploy:
+  # block out to run CPU-only (fine for the small triage model).
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    networks: [hq]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Dispatch entry point: git pull, queue scan, lightweight triage, discord
+  # sync, GTD housekeeping (docker/crontab). Part of the default profile.
+  hq-cron:
+    <<: *hq-common
+    container_name: hq-cron
+    depends_on: [forgejo]
+
+  # Collect worker: claims heavy jobs and runs hermes + the large local model
+  # against ollama (docker/crontab.worker). Opt in with `--profile worker`.
+  hq-worker:
+    <<: *hq-common
+    container_name: hq-worker
+    profiles: ["worker"]
+    depends_on: [forgejo]
+    command: ["/usr/local/bin/supercronic", "-passthrough-logs", "/hq/docker/crontab.worker"]
+
+  # Hermes Discord gateway. Separate service so it can be enabled/disabled
+  # independently and a crash can't disrupt the dispatch cron. Docker's restart
+  # policy handles crash-restarts. Opt in with `--profile discord`.
+  hq-discord:
+    <<: *hq-common
+    container_name: hq-discord
+    profiles: ["discord"]
+    depends_on: [forgejo]
+    command: ["hermes", "-p", "hq-local", "gateway", "run"]
+
+networks:
+  hq: {}
+
+volumes:
+  forgejo-data: {}
+  ollama-models: {}

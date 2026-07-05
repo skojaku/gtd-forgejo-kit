@@ -14,4 +14,4 @@ Goal: convert new email into (a) Inbox task cards and (b) draft replies. You nev
    - **Noise** (newsletters, notifications): skip silently.
 3. Finish with a short report: tasks filed (issue numbers), drafts created, items skipped.
 
-Never: `hq task update`/`done`, any status other than Inbox, labeling or deleting email, replying without `draft-reply`.
+Never: `hq task update` to any status other than Inbox, labeling or deleting email, replying without `draft-reply`.

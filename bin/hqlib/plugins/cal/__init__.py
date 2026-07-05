@@ -1,12 +1,11 @@
 """hq cal — Google Calendar via `gws`, with all scheduling policy in code.
 
-Policy (from config/env.yaml working_hours): weekday blocks, commute gap
+Policy (from config/hq.yaml working_hours): weekday blocks, commute gap
 (never bookable, splits blocks), max_bookable_pct and min_free_min
 (treat-time). Callers get policy-aware answers — no prose reasoning needed.
 
-`book` writes real events and is approval-gated: params must carry
-"approved": true, set only after the user has explicitly approved the
-sessions in conversation.
+Read + propose only: `agenda`/`free`/`check` report, and `propose` allocates
+sessions against the day budgets. This CLI does not write calendar events.
 """
 import json
 from datetime import date, datetime, timedelta
@@ -18,6 +17,19 @@ from ...common import (
 )
 
 NAME = "cal"
+
+BIN_DEPS = ["gws"]
+
+CONFIG_STUB = {
+    "calendar": {"zoom_url": "", "office_location": "", "default_duration_min": 60},
+    "working_hours": {
+        "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [],
+        "saturday": [], "sunday": [],
+        "commute": {"start": "", "end": ""},
+        "max_bookable_pct": 80,
+        "min_free_min": 30,
+    },
+}
 
 WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -289,9 +301,9 @@ def cmd_agenda(args):
 
 def cmd_free(args):
     cfg = load_config()
-    if not is_valid_date(args.frm) or not is_valid_date(args.to):
+    if not is_valid_date(args.from_) or not is_valid_date(args.to):
         fail("--from and --to must be YYYY-MM-DD")
-    days = compute_day_budgets(cfg, args.frm, args.to)
+    days = compute_day_budgets(cfg, args.from_, args.to)
     print_json([{
         "date": d["date"],
         "weekday": d["weekday"],
@@ -383,119 +395,33 @@ def cmd_propose(args):
     if not (frm and to and is_valid_date(frm) and is_valid_date(to)):
         fail("params must have 'from' and 'to' as YYYY-MM-DD")
 
-    if params.get("minutes"):
-        minutes = params["minutes"]
-        if not isinstance(minutes, int) or minutes <= 0:
-            fail("'minutes' must be a positive integer")
-        days = compute_day_budgets(cfg, frm, to)
-        sessions, remaining = allocate_sessions(days, minutes, min_session)
-        print_json({
-            "sessions": sessions,
-            "requested_min": minutes,
-            "allocated_min": minutes - remaining,
-            "shortfall_min": remaining,
-            "fits": remaining <= 0,
-        })
-        return
-
-    from .task import fetch_tasks
-    if params.get("project"):
-        tasks = [
-            t for t in fetch_tasks(cfg)
-            if (t["project"] or "").lower() == params["project"].lower()
-            and t["booked"] is None and t["status"] != "Done"
-        ]
-    elif params.get("issues"):
-        wanted = set(params["issues"])
-        tasks = [t for t in fetch_tasks(cfg) if t["issue"] in wanted]
-    else:
-        fail("params must have 'minutes', 'project', or 'issues'")
-
-    tasks.sort(key=lambda t: (t["due"] or "9999-99-99", t["duration"] or 0, t["title"] or ""))
+    minutes = params.get("minutes")
+    if not minutes:
+        fail("params must have a positive 'minutes'")
+    if not isinstance(minutes, int) or minutes <= 0:
+        fail("'minutes' must be a positive integer")
     days = compute_day_budgets(cfg, frm, to)
-
-    results = []
-    total_requested = total_allocated = 0
-    for t in tasks:
-        if not t["duration"]:
-            results.append({"issue": t["issue"], "title": t["title"], "skipped": "no duration set"})
-            continue
-        sessions, remaining = allocate_sessions(days, t["duration"], min_session)
-        allocated = t["duration"] - remaining
-        total_requested += t["duration"]
-        total_allocated += allocated
-        results.append({
-            "issue": t["issue"], "title": t["title"], "sessions": sessions,
-            "requested_min": t["duration"], "allocated_min": allocated, "shortfall_min": remaining,
-        })
-
+    sessions, remaining = allocate_sessions(days, minutes, min_session)
     print_json({
-        "tasks": results,
-        "totals": {"requested_min": total_requested, "allocated_min": total_allocated,
-                   "shortfall_min": total_requested - total_allocated},
-        "deadline_met": total_allocated >= total_requested,
-    })
-
-
-def cmd_book(args):
-    cfg = load_config()
-    params = read_params(args.file)
-
-    if params.get("approved") is not True:
-        fail(
-            'booking requires "approved": true in the params file — set it only '
-            "after the user has explicitly approved these exact sessions."
-        )
-
-    issue = params.get("issue")
-    sessions = params.get("sessions")
-    if not issue or not sessions:
-        fail("params must have 'issue' and a non-empty 'sessions' list")
-
-    from .task import find_item_id, edit_date
-    item_id, task = find_item_id(cfg, issue)
-    title = task["title"]
-    tz = tz_name(cfg)
-    calendar_id = params.get("calendar_id", "primary")
-
-    created = []
-    for s in sessions:
-        d, start, end = s.get("date"), s.get("start"), s.get("end")
-        if not (d and start and end):
-            fail(f"each session needs date/start/end, got: {s}")
-        run([
-            "gws", "calendar", "events", "insert",
-            "--params", json.dumps({"calendarId": calendar_id}),
-            "--json", json.dumps({
-                "summary": title,
-                "start": {"dateTime": f"{d}T{start}:00", "timeZone": tz},
-                "end": {"dateTime": f"{d}T{end}:00", "timeZone": tz},
-            }),
-        ])
-        created.append(s)
-
-    first_date = sessions[0]["date"]
-    edit_date(cfg, item_id, "scheduled", first_date)
-    edit_date(cfg, item_id, "booked", first_date)
-
-    print_json({
-        "issue": issue, "title": title, "sessions_created": created,
-        "calendar_id": calendar_id,
-        "scheduled": first_date, "booked": first_date,
+        "sessions": sessions,
+        "requested_min": minutes,
+        "allocated_min": minutes - remaining,
+        "shortfall_min": remaining,
+        "fits": remaining <= 0,
     })
 
 
 def register(sub):
-    p = sub.add_parser("cal", help="calendar (policy-aware; booking needs explicit user approval)")
+    p = sub.add_parser("cal", help="calendar (policy-aware; read + propose, no writes)")
     s2 = p.add_subparsers(dest="cal_cmd", required=True)
 
     s = s2.add_parser("agenda", help="upcoming events, small projection")
     s.add_argument("--days", type=int, default=1)
-    s.add_argument("--max", type=int, default=15)
+    s.add_argument("--max", type=int, default=10)
     s.set_defaults(func=cmd_agenda)
 
     s = s2.add_parser("free", help="free slots per day, net of working hours/commute/treat-time")
-    s.add_argument("--from", dest="frm", required=True)
+    s.add_argument("--from", dest="from_", required=True)
     s.add_argument("--to", required=True)
     s.set_defaults(func=cmd_free)
 
@@ -505,10 +431,6 @@ def register(sub):
     s.add_argument("--end", required=True, help="HH:MM")
     s.set_defaults(func=cmd_check)
 
-    s = s2.add_parser("propose", help="propose sessions from a JSON params file: {from, to, minutes|project|issues, min_session?}")
+    s = s2.add_parser("propose", help="propose sessions from a JSON params file: {from, to, minutes, min_session?}")
     s.add_argument("file")
     s.set_defaults(func=cmd_propose)
-
-    s = s2.add_parser("book", help='create events + set Scheduled/Booked — params must include "approved": true')
-    s.add_argument("file")
-    s.set_defaults(func=cmd_book)

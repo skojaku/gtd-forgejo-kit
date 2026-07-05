@@ -1,25 +1,51 @@
 ---
 name: setup
-description: Interactive setup wizard for `config/env.yaml`. Use when the user says "setup", "configure", "set up env", or when `config/env.yaml` is missing.
+description: Interactive setup wizard for `config/hq.yaml`. Use when the user says "setup", "configure", "set up env", or when `config/hq.yaml` is missing.
 ---
 
 # Setup Wizard
 
-Guide the user through creating or updating `config/env.yaml` — the gitignored, host-local config every `hq` command reads. Public identifiers (owner/repo/forgejo_url) live in the committed `config/project.yaml` and rarely change.
+You are a thin wrapper around the built-in `hq setup` command. It does the real work
+(writes config, detects UID/GID/TZ, checks reachability, and on Tier 2 bootstraps
+Forgejo). Your job is to ask the human the questions it needs and run it for them.
 
-## Steps
+`config/hq.yaml` is the gitignored, host-local config every `hq` command reads. The
+tracked template is `config/hq.example.yaml`. There is no separate `project.yaml` and no
+GitHub anymore — the backend is Forgejo, and `forgejo_url` is personal, so it lives in
+`hq.yaml` too.
 
-Start from the template: `cp config/env.example.yaml config/env.yaml` (never overwrite an existing env.yaml without asking). Then walk through the sections, asking only what the template can't default:
+## Pick the tier
 
-1. **Identity** — full name, Forgejo username, IANA timezone (validate it contains `/`). `repo.name` = `<username>/<repo>`.
-2. **Calendar defaults** — Zoom URL, office location, default duration.
-3. **Working hours** — per-day blocks as `HH:MM-HH:MM` lists (validate the pattern); optional commute gap; `max_bookable_pct` (default 80) and `min_free_min` (default 30).
-4. **Forgejo repo** — confirm `config/project.yaml` values (owner/repo/forgejo_url); verify access with `hq task config`.
-5. **Gmail accounts** — for each account: name (e.g. `work`), `config_dir` (the `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`; blank if this host has a single gws account at the default location), and `mail_url_index` (the account's position in the browser's Gmail switcher, for building message links).
-6. **Collect + queue** — defaults are fine for most users; on the entry-point host set `queue.runners.triage.pi_args` to a small local model, on the processing host set `collect`/`full-sweep` runners and `warm_url`.
+1. **CLI only** — a laptop that just talks to an existing Forgejo over the tailnet.
+2. **Server stack** — the always-on host running docker compose (forgejo + ollama +
+   hq-cron). This tier also bootstraps Forgejo (admin, repo, API token, GTD labels).
+3. **Extra worker** — another machine that claims collect jobs from the hub's Forgejo.
 
-Finish by running `hq task config` to confirm the project resolves, and show the user a summary.
+## Run it
+
+Interactive: `./bin/hq setup` (prompts on stdin, prints the compose/ollama commands to
+run afterwards). Ask the human for the values it needs and pass them as flags when you
+already know them:
+
+- `--tier {1,2,3}`
+- `--username`, `--repo` (Forgejo `owner/name` slug), `--timezone` (must contain `/`)
+- `--forgejo-url` (base URL of the Forgejo instance)
+- Tier 2 only: `--bind-ip`, `--domain`, `--admin-user`, `--admin-password`, and either
+  `--forgejo-token` (reuse an existing token) or `--token-name` (mint one).
+
+`hq setup` never overwrites an existing `config/hq.yaml`/`.env` unless you pass `--force`
+— confirm with the user before forcing.
+
+## After setup
+
+- Fill any placeholders the wizard reported in `config/hq.yaml` (e.g. per-account gws
+  `config_dir` and `mail_url_index` under `google.accounts`, working-hour blocks).
+- Run `./bin/hq doctor` — it checks binaries, config keys, token validity, Forgejo/ollama
+  reachability, and container/cron freshness, and prints a FIX line per failure. Walk the
+  user through anything red.
+- Per-plugin scaffolding without the full wizard: `./bin/hq install <mail|cal|drive|discord|core|all>`.
 
 ## Docker / other hosts
 
-Bind-mount the file: `docker run -v /path/to/config/env.yaml:/app/config/env.yaml:ro …`. Each host keeps its own env.yaml (accounts and runners differ per host); only `config/project.yaml` is shared through git.
+Bind-mount the config: `docker run -v /path/to/config/hq.yaml:/hq/config/hq.yaml:ro …`.
+Each host keeps its own `hq.yaml` (accounts and runners differ per host).

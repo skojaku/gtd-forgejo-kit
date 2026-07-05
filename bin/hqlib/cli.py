@@ -8,16 +8,19 @@ hqlib/plugins/__init__.py for the plugin contract.
 """
 import argparse
 
-from . import task, wiki, queue, plugins
+from . import task, wiki, queue, plugins, install, cron, setup, doctor
 
 
 def build_parser():
     p = argparse.ArgumentParser(
         prog="hq",
         description=(
-            "Unified HQ CLI. Core: task (GTD project), wiki (search), queue (automation). "
+            "Unified HQ CLI. Core: task (GTD project), wiki (search), queue (automation), "
+            "cron (scheduled sweeps), setup (tier-aware install wizard), "
+            "doctor (read-only health check), install (deps + config scaffolding). "
             "Plugins (discovered from hqlib/plugins/): mail (Gmail, drafts only), "
-            "cal (calendar, policy-aware), drive (read-only). "
+            "cal (calendar, policy-aware), drive (read-only), "
+            "discord (optional Forgejo<->Discord thread mirror). "
             "All output is small JSON; errors are {\"error\": ...} with exit 1."
         ),
     )
@@ -25,6 +28,10 @@ def build_parser():
     task.register(sub)
     wiki.register(sub)
     queue.register(sub)
+    cron.register(sub)
+    setup.register(sub)
+    doctor.register(sub)
+    install.register(sub)
     for plugin in plugins.discover():
         plugin.register(sub)
     return p

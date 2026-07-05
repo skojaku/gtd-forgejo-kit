@@ -1,43 +1,74 @@
-"""hq queue — event detection and the job queue between the master and workers.
+"""hq queue — event detection and the job queue, backed by Forgejo issue labels.
 
-Roles (config: queue.* in env.yaml):
-- master (always-on entry point): `hq queue scan` (cron) detects new issue
-  activity plus whatever event sources each plugin's `scan()` hook adds
-  (e.g. the mail plugin's new-unread-mail detection), and writes job files;
-  small-model triage jobs are processed locally with `hq queue work --types
-  triage`.
-- workers (heavier local models): `hq queue work --types collect --remote
-  <master-ssh-alias>` claims jobs over ssh and runs them against their own
-  local model.
+Queue state lives on Forgejo, not on disk. A job is one of:
 
-Jobs are JSON files under queue/pending|processing|done|failed. Retries are
-encoded in the filename (….r0.json → ….r1.json) so remote claiming never has
-to rewrite file contents. Everything here is deterministic — the LLM only
-runs inside `work`, via pi, with a per-type prompt template.
+  * a **collect** job — the target GTD issue itself carries the lifecycle
+    labels (collect enriches that issue in place, so no separate ticket is
+    needed and the repo does not fill up with per-task job issues); or
+  * a **triage / thread_update / forced-collect** job — a standalone `hq-job`
+    issue whose body holds the JSON payload (these are email events that have
+    no task issue yet, or a collect that must carry a `force` flag).
 
-Job types: "collect" is handled here directly (run_collect_job, core — it's
-Forgejo-native, not source-specific). Any other type is offered to each
-plugin's optional `handle_job()` hook first (e.g. the mail plugin owns
-"thread_update"); if no plugin claims it, it falls through to the generic
-prompt-driven `run_job_llm` (this is how "triage" is processed — no
-plugin-specific code needed for a job type that's just "run this prompt").
+Lifecycle is an exclusive scoped-label swap on the carrier issue:
+
+    queue/pending  ->  queue/claimed:<worker>  ->  done
+
+"done" means: close the `hq-job` ticket, or (for an in-place collect) drop the
+lifecycle label from the still-open task issue. Claiming is atomic: adding
+`queue/claimed:<worker>` auto-removes `queue/pending` (they share the exclusive
+scope `queue`), then we re-read the issue and keep the job only if our own
+claim label is the one that stuck — so when two workers race for the same job,
+exactly one proceeds and the other skips.
+
+Any worker with a Forgejo token can participate: no ssh, no shared filesystem,
+no local queue-state file, survives container rebuilds. Only the per-worker
+transcripts and the small scan cursor (seen mail ids / last-scan timestamps)
+stay local, under queue/. The mail-thread ↔ issue marker convention lives
+entirely in the mail plugin now (it owns that regex); core no longer knows it.
+
+Two job classes, two runner mechanisms — matched to model capability
+(PLAN.md workstream 4):
+
+  * "triage" (small 4B model) is NOT agentic — it is one deterministic
+    transformation. `run_triage_job` fetches the email itself, makes ONE direct
+    ollama structured-output call (see hqlib/ollama.py), and applies the result
+    via the existing `hq task add` / `hq mail draft-reply` code paths. No
+    hermes, no soul file, no memory, no tool schemas.
+  * "collect" (large 27B model) genuinely needs an agent loop across
+    mail/drive/wiki, so `run_collect_job` drives `hermes -z -p hq-local` with
+    the collect prompt (model from hq.yaml queue.runners.collect.model),
+    pointed at ollama by the hq-local profile config.
+
+Any other type is offered to each plugin's optional `handle_job()` hook first
+(e.g. the mail plugin owns "thread_update"); if no plugin claims it, it falls
+through to run_job_llm, which is now just a "no runner for this type" stub.
+The LLM only ever runs inside `work`.
 """
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import time
-import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .common import fail, load_config, owner, repo_name, forgejo_url, repo_root, print_json
-from .forgejo import ForgejoClient
+from . import ollama
+from .common import fail, load_config, owner, client, repo_root, print_json
 
 MAX_RETRIES = 3
-SEEN_IDS_CAP = 500
-SSH_OPTS = ["-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+SEEN_IDS_CAP = 2000
+
+# Lifecycle labels. queue/pending, queue/failed and every queue/claimed:<w>
+# share the exclusive scope "queue" (the text before the last "/"), so adding
+# one Forgejo auto-removes the others — that is the atomic claim/complete swap.
+JOB_LABEL = "hq-job"          # marks a standalone job ticket (not a GTD task)
+L_PENDING = "queue/pending"
+L_FAILED = "queue/failed"
+CLAIM_PREFIX = "queue/claimed:"
+
+_JOB_RE = re.compile(r"<!--\s*hq-job (\{.*\})\s*-->", re.DOTALL)
 
 
 def queue_cfg(cfg):
@@ -45,8 +76,10 @@ def queue_cfg(cfg):
 
 
 def queue_dir(cfg):
+    """Local scratch only: transcripts (logs/) and the collect dossier hand-off
+    (out/). Job STATE lives on Forgejo, not here."""
     d = repo_root() / queue_cfg(cfg).get("dir", "queue")
-    for sub in ("pending", "processing", "done", "failed"):
+    for sub in ("logs", "out"):
         (d / sub).mkdir(parents=True, exist_ok=True)
     return d
 
@@ -55,30 +88,30 @@ def now_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def job_filename(job_type, target, retries=0):
-    return f"{now_stamp()}-{job_type}-{target}.r{retries}.json"
+def worker_name():
+    """Identity for the claimed:<worker> label. $HQ_WORKER_NAME wins; else the
+    short hostname."""
+    name = os.environ.get("HQ_WORKER_NAME")
+    if name and name.strip():
+        return name.strip()
+    return socket.gethostname().split(".")[0] or "worker"
 
 
-def parse_job_filename(name):
-    """→ (type, target, retries) or None."""
-    if not name.endswith(".json"):
+def _parse_rfc3339(text):
+    """Forgejo timestamp → epoch seconds, or None."""
+    if not text:
         return None
-    stem = name[: -len(".json")]
-    if ".r" not in stem:
-        return None
-    head, _, r = stem.rpartition(".r")
     try:
-        retries = int(r)
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
-    parts = head.split("-", 2)
-    if len(parts) < 3:
-        return None
-    return parts[1], parts[2], retries
 
 
 # --------------------------------------------------------------------------
-# State
+# Scan cursor — a tiny local cache so `scan` doesn't re-file the same events.
+# This is NOT queue state (that's on Forgejo); it's the poller's memory of
+# which mail ids it has already seen and when it last swept. Lives on the one
+# host that runs `scan` (the cron container), never synced anywhere.
 # --------------------------------------------------------------------------
 
 def state_path(cfg):
@@ -100,47 +133,218 @@ def save_state(cfg, state):
     state_path(cfg).write_text(json.dumps(state, indent=2))
 
 
-def existing_targets(qdir):
-    """(type, target) pairs already pending or processing — the dedup set."""
-    pairs = set()
-    for sub in ("pending", "processing"):
-        for f in (qdir / sub).glob("*.json"):
-            parsed = parse_job_filename(f.name)
-            if parsed:
-                pairs.add((parsed[0], parsed[1]))
-    return pairs
+# --------------------------------------------------------------------------
+# QueueClient — the Forgejo-label-backed queue. All claim/complete/list state
+# lives on issues; this wraps ForgejoClient with the label bookkeeping.
+# --------------------------------------------------------------------------
 
+class QueueClient:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.client = client(cfg)
+        self._base_ready = False
+        self._claim_ready = set()
 
-def enqueue(qdir, job_type, target, payload):
-    path = qdir / "pending" / job_filename(job_type, target)
-    payload = dict(payload, type=job_type, created=now_stamp())
-    path.write_text(json.dumps(payload, indent=2))
-    return path.name
+    # -- label plumbing --------------------------------------------------
+    def _create_label(self, name, color, exclusive):
+        try:
+            self.client.create_label(name, color, exclusive=exclusive)
+        except RuntimeError as e:
+            if "already exists" not in str(e).lower():
+                raise
+
+    def _ensure_base(self):
+        if self._base_ready:
+            return
+        existing = {l["name"] for l in self.client.list_labels()}
+        for name, color, excl in (
+            (JOB_LABEL, "ededed", False),
+            (L_PENDING, "fbca04", True),
+            (L_FAILED, "b60205", True),
+        ):
+            if name not in existing:
+                self._create_label(name, color, excl)
+        self._base_ready = True
+
+    def _ensure_claim(self, worker):
+        if worker in self._claim_ready:
+            return
+        self._create_label(CLAIM_PREFIX + worker, "0e8a16", True)
+        self._claim_ready.add(worker)
+
+    @staticmethod
+    def has_lifecycle_label(labels):
+        return any(
+            l == L_PENDING or l == L_FAILED or l.startswith(CLAIM_PREFIX)
+            for l in labels
+        )
+
+    # -- job body encoding (standalone hq-job tickets only) --------------
+    @staticmethod
+    def _job_body(job_type, target, payload, retries):
+        meta = {"type": job_type, "target": str(target), "payload": payload or {},
+                "retries": retries, "created": now_stamp()}
+        return ("Automation job ticket managed by `hq queue`. Safe to close.\n\n"
+                f"<!-- hq-job {json.dumps(meta)} -->\n")
+
+    @staticmethod
+    def _parse_job_body(body):
+        m = _JOB_RE.search(body or "")
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            return None
+
+    def _job_from_issue(self, issue):
+        """Classify a Forgejo issue into a job dict. An hq-job ticket carries
+        its type/target/payload in the body; any other lifecycle-labeled issue
+        is an in-place collect on that GTD task."""
+        labels = [l["name"] for l in (issue.get("labels") or [])]
+        claim = next((l for l in labels if l.startswith(CLAIM_PREFIX)), None)
+        base = {
+            "carrier": issue["number"],
+            "pending": L_PENDING in labels,
+            "failed": L_FAILED in labels,
+            "claimed_by": claim[len(CLAIM_PREFIX):] if claim else None,
+            "updated_at": issue.get("updated_at"),
+        }
+        if JOB_LABEL in labels:
+            meta = self._parse_job_body(issue.get("body")) or {}
+            base.update(
+                type=meta.get("type"), target=str(meta.get("target")),
+                payload=meta.get("payload") or {}, retries=int(meta.get("retries", 0)),
+                is_job_issue=True,
+            )
+        else:
+            base.update(
+                type="collect", target=str(issue["number"]),
+                payload={"issue": issue["number"]}, retries=0, is_job_issue=False,
+            )
+        return base
+
+    # -- producer side ---------------------------------------------------
+    def enqueue(self, job_type, target, payload=None):
+        """File a job. A plain collect labels the target task in place; every
+        other type (and a forced collect, which must carry force=True) becomes
+        a standalone hq-job ticket."""
+        payload = payload or {}
+        self._ensure_base()
+        if job_type == "collect" and not payload.get("force"):
+            issue = int(payload.get("issue") or target)
+            self.client.add_labels(issue, [L_PENDING])  # exclusive: clears any claim
+            return f"collect#{issue}"
+        body = self._job_body(job_type, target, payload, retries=0)
+        created = self.client.create_issue(
+            f"[hq-job] {job_type}:{target}", body=body, labels=[JOB_LABEL, L_PENDING]
+        )
+        return f"{job_type}#{created.get('number')}"
+
+    def existing_targets(self):
+        """(type, target) pairs for open standalone hq-job tickets — the dedup
+        set `scan` seeds so it never files a second triage/thread_update for a
+        message already queued. In-place collect dedup is done inline in scan
+        via each issue's own lifecycle label."""
+        pairs = set()
+        for i in self.client.list_issues(state="open", labels=JOB_LABEL):
+            meta = self._parse_job_body(i.get("body"))
+            if meta and meta.get("type") and meta.get("target") is not None:
+                pairs.add((meta["type"], str(meta["target"])))
+        return pairs
+
+    # -- consumer side ---------------------------------------------------
+    def list_pending(self):
+        self._ensure_base()
+        issues = self.client.list_issues(state="open", labels=L_PENDING)
+        return [self._job_from_issue(i) for i in issues]
+
+    def claim(self, job, worker):
+        """Atomic claim: add queue/claimed:<worker> (exclusive scope removes
+        queue/pending), then re-read and keep the job only if ours is the sole
+        claim label — otherwise another worker won the race and we skip."""
+        carrier = job["carrier"]
+        claim_label = CLAIM_PREFIX + worker
+        self._ensure_base()
+        self._ensure_claim(worker)
+        self.client.add_labels(carrier, [claim_label])
+        labels = self.client.issue_labels(carrier)
+        claims = [l for l in labels if l.startswith(CLAIM_PREFIX)]
+        return claims == [claim_label]
+
+    def finish(self, job, worker, ok):
+        carrier = job["carrier"]
+        claim_label = CLAIM_PREFIX + worker
+        if ok:
+            if job["is_job_issue"]:
+                self.client.edit_issue(carrier, state="closed")
+            else:
+                # In-place collect done: drop the lifecycle label, leave the
+                # task issue open.
+                self.client.remove_label(carrier, claim_label)
+            return "done"
+
+        # failure
+        if not job["is_job_issue"]:
+            # A failed in-place collect just loses its label; the next scan
+            # re-detects it if the dossier is still stale.
+            self.client.remove_label(carrier, claim_label)
+            return "requeued"
+        retries = job.get("retries", 0) + 1
+        if retries > MAX_RETRIES:
+            self.client.add_labels(carrier, [L_FAILED])  # exclusive: clears claim
+            self.client.edit_issue(carrier, state="closed")
+            return "failed"
+        self.client.edit_issue(
+            carrier, body=self._job_body(job["type"], job["target"], job["payload"], retries)
+        )
+        self.client.add_labels(carrier, [L_PENDING])  # exclusive: clears claim
+        return "requeued"
+
+    def reclaim_stale(self, stale_seconds):
+        """Return claimed jobs whose claim is older than the timeout back to
+        pending so a dead/stuck worker can't strand them. Timestamp check is on
+        the issue's updated_at (the claim label swap bumps it)."""
+        if stale_seconds <= 0:
+            return []
+        cutoff = datetime.now(timezone.utc).timestamp() - stale_seconds
+        reclaimed = []
+        for i in self.client.list_issues(state="open"):
+            labels = [l["name"] for l in (i.get("labels") or [])]
+            if not any(l.startswith(CLAIM_PREFIX) for l in labels):
+                continue
+            ts = _parse_rfc3339(i.get("updated_at"))
+            if ts is not None and ts < cutoff:
+                self.client.add_labels(i["number"], [L_PENDING])  # exclusive: clears claim
+                reclaimed.append(i["number"])
+        return reclaimed
+
+    def snapshot(self):
+        """Live queue state from Forgejo for `hq queue list`."""
+        self._ensure_base()
+        pending, claimed, failed = [], [], []
+        for i in self.client.list_issues(state="open"):
+            labels = [l["name"] for l in (i.get("labels") or [])]
+            if not (JOB_LABEL in labels or self.has_lifecycle_label(labels)):
+                continue
+            job = self._job_from_issue(i)
+            desc = {"type": job["type"], "target": job["target"], "carrier": job["carrier"]}
+            if L_PENDING in labels:
+                pending.append(desc)
+            if job["claimed_by"]:
+                claimed.append({**desc, "worker": job["claimed_by"]})
+            if L_FAILED in labels:
+                failed.append(desc)
+        return {"pending": pending, "claimed": claimed, "failed": failed}
 
 
 # --------------------------------------------------------------------------
-# Thread tracking — link a producer's own reference (e.g. a Gmail thread id,
-# via the mail plugin's `<!-- email-thread:... -->` marker) to the issue its
-# triage created, so a later event on that thread logs onto the issue and
-# refreshes its dossier instead of spawning a duplicate card. The marker
-# format itself is a plugin convention (currently only the mail plugin
-# writes one); core just knows the one regex, not any plugin's code.
+# scan — deterministic event detection (runs on the cron host)
 # --------------------------------------------------------------------------
 
-_EMAIL_THREAD_RE = re.compile(r"<!--\s*email-thread:([A-Za-z0-9_-]+)\s*-->")
-
-
-def _client(cfg):
-    return ForgejoClient(forgejo_url(cfg), owner(cfg), repo_name(cfg))
-
-
-# --------------------------------------------------------------------------
-# scan — deterministic event detection (runs on the master)
-# --------------------------------------------------------------------------
-
-def scan_issues(cfg, state, qdir, taken):
+def scan_issues(cfg, state, q, taken):
     from .dossier import MARKER_PREFIX
-    client = _client(cfg)
+    client = q.client
     user_login = owner(cfg)
     since = state.get("last_issue_scan")
     scan_started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -149,26 +353,20 @@ def scan_issues(cfg, state, qdir, taken):
 
     created = []
     for issue in issues:
+        labels = [l["name"] for l in (issue.get("labels") or [])]
+        if JOB_LABEL in labels:
+            continue  # our own job tickets are not collect targets
         n = issue["number"]
-        # Learn a producer's thread ↔ issue link from the marker embedded in
-        # the body (see module docstring above), so that producer's own scan
-        # can route future events here. Free — this scan already fetched the
-        # body. Drop the mapping if the issue has closed.
-        mt = _EMAIL_THREAD_RE.search(issue.get("body") or "")
-        if mt:
-            tmap = state.setdefault("email_threads", {})
-            if (issue.get("state") or "").lower() == "closed":
-                tmap.pop(mt.group(1), None)
-            else:
-                tmap[mt.group(1)] = n
         if ("collect", str(n)) in taken:
+            continue
+        if q.has_lifecycle_label(labels):
+            taken.add(("collect", str(n)))  # a collect is already queued/claimed
             continue
         needs_collect = False
         if since is None or issue.get("created_at", "") > since:
             needs_collect = True
         else:
-            comments = client.list_comments(n)
-            for c in comments:
+            for c in client.list_comments(n):
                 body = c.get("body") or ""
                 if body.startswith(MARKER_PREFIX):
                     continue
@@ -176,7 +374,7 @@ def scan_issues(cfg, state, qdir, taken):
                     needs_collect = True
                     break
         if needs_collect:
-            created.append(enqueue(qdir, "collect", str(n), {"issue": n}))
+            created.append(q.enqueue("collect", str(n), {"issue": n}))
             taken.add(("collect", str(n)))
 
     state["last_issue_scan"] = scan_started
@@ -185,69 +383,76 @@ def scan_issues(cfg, state, qdir, taken):
 
 def cmd_scan(args):
     cfg = load_config()
-    qdir = queue_dir(cfg)
+    q = QueueClient(cfg)
     state = load_state(cfg)
-    taken = existing_targets(qdir)
+    taken = q.existing_targets()
 
     from . import plugins
 
     created = []
-    created += scan_issues(cfg, state, qdir, taken)
+    created += scan_issues(cfg, state, q, taken)
     for plugin in plugins.discover():
         plugin_scan = getattr(plugin, "scan", None)
         if plugin_scan:
-            created += plugin_scan(cfg, state, qdir, taken) or []
+            created += plugin_scan(cfg, state, q, taken) or []
 
-    # Daily backstop: refresh dossiers on active tasks. Expanded here into
-    # per-issue collect jobs — one issue per LLM invocation, no batch job.
+    # Daily backstop: refresh dossiers on active tasks — one collect per issue.
     today = date.today().isoformat()
     if state.get("last_full_sweep") != today:
         from .task import fetch_tasks
         for t in fetch_tasks(cfg):
             if (t["status"] or "").lower() in ("next", "waiting") and t["issue"]:
                 target = str(t["issue"])
-                if ("collect", target) not in taken:
-                    created.append(enqueue(qdir, "collect", target, {"issue": t["issue"]}))
+                if ("collect", target) in taken:
+                    continue
+                if q.has_lifecycle_label(t.get("labels") or []):
                     taken.add(("collect", target))
+                    continue
+                created.append(q.enqueue("collect", target, {"issue": t["issue"]}))
+                taken.add(("collect", target))
         state["last_full_sweep"] = today
 
     save_state(cfg, state)
-    print_json({"created": created, "pending": len(list((qdir / "pending").glob("*.json")))})
+    print_json({"created": created, "pending": len(q.snapshot()["pending"])})
 
 
 # --------------------------------------------------------------------------
-# work — process jobs with pi (local queue or remote over ssh)
+# work — claim + run jobs (local host, no ssh). Triage runs via a direct ollama
+# call, collect via hermes; anything else falls to the run_job_llm stub.
 # --------------------------------------------------------------------------
+
+# Default local model names (qwen family) — overridable per job type in
+# hq.yaml queue.runners.<type>.model. 4B for the single-shot triage transform,
+# 27B for the agentic collect loop.
+DEFAULT_TRIAGE_MODEL = "qwen3.5:4b"
+DEFAULT_COLLECT_MODEL = "qwen3.6:27b"
+DEFAULT_COLLECT_PROFILE = "hq-local"
+
+# Structured-output schema the triage model MUST fill. ollama enforces it as
+# the request `format`, so the CLI can trust the shape without re-prompting.
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {"type": "string", "enum": ["task", "noise"]},
+        "task_title": {"type": "string"},
+        "task_body": {"type": "string"},
+        "draft_reply": {"type": "string"},
+    },
+    "required": ["category", "task_title", "task_body", "draft_reply"],
+}
+
 
 def runner_cfg(cfg, job_type):
     runners = queue_cfg(cfg).get("runners") or {}
     rc = runners.get(job_type) or {}
-    prompt = rc.get("prompt", f"scripts/prompts/{job_type}.md")
-    pi_args = rc.get("pi_args", [])
-    # Per-host pi_args override so aster's fallback collect can pin a local model
-    # (e.g. --provider ollama --model qwen3.6:27b) WITHOUT editing the shared
-    # config the Mac also reads. Env name: HQ_<TYPE>_PI_ARGS (e.g.
-    # HQ_COLLECT_PI_ARGS). Empty/unset -> config default.
-    override = os.environ.get(f"HQ_{job_type.upper().replace('-', '_')}_PI_ARGS")
-    if override:
-        pi_args = shlex.split(override)
+    default_model = {"triage": DEFAULT_TRIAGE_MODEL,
+                     "collect": DEFAULT_COLLECT_MODEL}.get(job_type)
     return {
-        "pi_args": pi_args,
-        "prompt": prompt,
-        "warm_url": rc.get("warm_url"),
+        "model": rc.get("model", default_model),
+        "profile": rc.get("profile", DEFAULT_COLLECT_PROFILE),
+        "prompt": rc.get("prompt", f"scripts/prompts/{job_type}.md"),
         "timeout_min": rc.get("timeout_min", 20),
     }
-
-
-def warm_endpoint(url, wait_s=90):
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=5):
-                return True
-        except OSError:
-            time.sleep(5)
-    return False
 
 
 def render_prompt(template_path, payload):
@@ -262,20 +467,147 @@ def render_prompt(template_path, payload):
     return text
 
 
-def run_job_llm(cfg, job_type, payload, log, job_name="job"):
-    rc = runner_cfg(cfg, job_type)
-    if rc["warm_url"] and not warm_endpoint(rc["warm_url"]):
-        return False, f"endpoint {rc['warm_url']} did not come up"
-    prompt = render_prompt(rc["prompt"], payload)
-    cmd = ["pi"] + list(rc["pi_args"]) + ["--no-session", "-p", prompt]
+def _write_log(cfg, job_name, cmd, stdout, stderr, note=""):
+    logs_dir = queue_dir(cfg) / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    quoted = " ".join(shlex.quote(c) for c in cmd)
+    (logs_dir / f"{job_name}.log").write_text(
+        f"$ {quoted}\n{note}\n--- stdout ---\n{stdout or ''}\n"
+        f"--- stderr ---\n{stderr or ''}"
+    )
 
-    def write_log(stdout, stderr, note=""):
-        logs_dir = queue_dir(cfg) / "logs"
-        logs_dir.mkdir(exist_ok=True)
-        (logs_dir / f"{job_name}.log").write_text(
-            f"$ {' '.join(shlex.quote(c) for c in cmd)}\n{note}\n"
-            f"--- stdout ---\n{stdout or ''}\n--- stderr ---\n{stderr or ''}"
+
+# --------------------------------------------------------------------------
+# Triage runner — direct ollama, NO agent. One structured-output call per
+# email; the CLI applies the result deterministically. Testable with a fixture
+# email via classify_email() (which is the only part that touches the model).
+# --------------------------------------------------------------------------
+
+def classify_email(cfg, email, model=None):
+    """The model half of triage: hand ollama the triage prompt + the email text
+    and get back the enforced {category, task_title, task_body, draft_reply}.
+    `email` is the dict from mail.read_message (from/subject/date/body/...).
+    Deterministic and side-effect-free, so a fixture email can exercise it."""
+    rc = runner_cfg(cfg, "triage")
+    model = model or rc["model"]
+    prompt = render_prompt(rc["prompt"], {
+        "from": email.get("from", ""),
+        "subject": email.get("subject", ""),
+        "date": email.get("date", ""),
+        "body": email.get("body", ""),
+    })
+    result = ollama.generate_json(
+        prompt, TRIAGE_SCHEMA, model, cfg=cfg,
+        timeout=rc["timeout_min"] * 60,
+    )
+    if result.get("category") not in ("task", "noise"):
+        raise RuntimeError(f"triage model returned bad category: {result!r}")
+    return result
+
+
+def _hq_cli_json(args):
+    """Run `./bin/hq …` in-repo and parse its JSON stdout. Reuses the exact CLI
+    entry points (task add / mail draft-reply) so triage applies results through
+    the same validated code paths a human would."""
+    hq = str(repo_root() / "bin" / "hq")
+    proc = subprocess.run([hq, *args], capture_output=True, text=True,
+                          cwd=str(repo_root()))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`hq {' '.join(args)}` failed: "
+            f"{(proc.stderr or proc.stdout).strip()[:400]}"
         )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"raw": proc.stdout.strip()}
+
+
+def run_triage_job(cfg, payload, log, job_name):
+    """Turn one unread email into an Inbox task card (+ optional draft reply)
+    via a single direct ollama call. Noise is dropped. We fetch the email and
+    apply the result; the model only classifies."""
+    from .plugins.mail import read_message, thread_marker
+
+    mid = payload.get("message_id")
+    tid = payload.get("thread_id")
+    if not mid:
+        return False, "triage job missing message_id"
+
+    try:
+        email = read_message(cfg, mid)
+    except Exception as e:  # gws/network failure — requeue
+        return False, f"could not read email {mid}: {e}"
+
+    try:
+        result = classify_email(cfg, email)
+    except RuntimeError as e:
+        _write_log(cfg, job_name, ["ollama", "triage", mid], "", str(e),
+                   note="triage model call failed")
+        return False, str(e)
+
+    category = result["category"]
+    if category == "noise":
+        log.append({"job": job_name, "category": "noise", "message_id": mid})
+        return True, None
+
+    title = (result.get("task_title") or "").strip() or email.get("subject") or "Follow up on email"
+    body_lines = [(result.get("task_body") or "").strip(),
+                  f"\nFrom: {email.get('from', 'unknown')}",
+                  f"Email: {email.get('url', '')}"]
+    if tid:
+        # Bind this Gmail thread to the issue so later replies log here instead
+        # of spawning a duplicate card. The marker convention lives in the mail
+        # plugin; we ask it for the exact string rather than hardcoding it.
+        body_lines.append(thread_marker(tid))
+    notes = "\n".join(line for line in body_lines if line is not None)
+
+    params_file = queue_dir(cfg) / "out" / f"triage-{mid}.json"
+    params_file.parent.mkdir(exist_ok=True)
+    params_file.write_text(json.dumps({"title": title, "notes": notes}))
+    try:
+        added = _hq_cli_json(["task", "add", str(params_file)])
+    except RuntimeError as e:
+        return False, str(e)
+    finally:
+        params_file.unlink(missing_ok=True)
+
+    outcome = {"job": job_name, "category": "task",
+               "issue": added.get("issue"), "message_id": mid}
+
+    draft = (result.get("draft_reply") or "").strip()
+    if draft:
+        reply_file = queue_dir(cfg) / "out" / f"triage-reply-{mid}.txt"
+        reply_file.write_text(draft)
+        try:
+            _hq_cli_json(["mail", "draft-reply", mid, "--body-file", str(reply_file)])
+            outcome["draft_reply"] = True
+        except RuntimeError as e:
+            # The task card exists — a failed draft shouldn't fail the job or
+            # trigger a retry that re-files the card. Note it and move on.
+            outcome["draft_reply_error"] = str(e)
+        finally:
+            reply_file.unlink(missing_ok=True)
+
+    log.append(outcome)
+    return True, None
+
+
+# --------------------------------------------------------------------------
+# Collect runner — hermes agent loop (27B). Multi-step tool use across
+# mail/drive/wiki, so it IS agentic. Hermes memory on (27B handles writes).
+# --------------------------------------------------------------------------
+
+def run_hermes_collect(cfg, payload, log, job_name):
+    """Drive `hermes -z -p hq-local` with the collect prompt. Hermes reaches
+    ollama via the hq-local profile config (base_url http://ollama:11434); the
+    model comes from hq.yaml queue.runners.collect.model. The model writes the
+    dossier JSON to out_file; run_collect_job validates and posts it."""
+    rc = runner_cfg(cfg, "collect")
+    prompt = render_prompt(rc["prompt"], payload)
+    cmd = ["hermes", "-z", prompt, "-p", rc["profile"]]
+    if rc["model"]:
+        cmd += ["-m", rc["model"]]
 
     try:
         proc = subprocess.run(
@@ -285,80 +617,27 @@ def run_job_llm(cfg, job_type, payload, log, job_name="job"):
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-        write_log(out, err, note=f"TIMED OUT after {rc['timeout_min']} min")
-        return False, f"pi timed out after {rc['timeout_min']} min"
+        _write_log(cfg, job_name, cmd, out, err,
+                   note=f"TIMED OUT after {rc['timeout_min']} min")
+        return False, f"hermes timed out after {rc['timeout_min']} min"
     except FileNotFoundError:
-        return False, "pi is not installed on this host"
-    write_log(proc.stdout, proc.stderr, note=f"exit {proc.returncode}")
-    log.append({"cmd": " ".join(shlex.quote(c) for c in cmd[:5]) + " …",
-                "exit": proc.returncode,
+        return False, "hermes is not installed on this host"
+
+    _write_log(cfg, job_name, cmd, proc.stdout, proc.stderr, note=f"exit {proc.returncode}")
+    log.append({"cmd": "hermes -z … -p " + rc["profile"], "exit": proc.returncode,
                 "tail": (proc.stdout + proc.stderr)[-500:]})
-    return proc.returncode == 0, None if proc.returncode == 0 else f"pi exited {proc.returncode}"
+    if proc.returncode != 0:
+        return False, f"hermes exited {proc.returncode}"
+    return True, None
 
 
-class LocalQueue:
-    def __init__(self, cfg):
-        self.qdir = queue_dir(cfg)
-
-    def list_pending(self):
-        return sorted(f.name for f in (self.qdir / "pending").glob("*.json"))
-
-    def claim(self, name):
-        src = self.qdir / "pending" / name
-        dst = self.qdir / "processing" / name
-        src.rename(dst)
-        return json.loads(dst.read_text())
-
-    def finish(self, name, ok):
-        src = self.qdir / "processing" / name
-        if ok:
-            src.rename(self.qdir / "done" / name)
-            return "done"
-        parsed = parse_job_filename(name)
-        retries = parsed[2] + 1
-        new_name = name.rsplit(".r", 1)[0] + f".r{retries}.json"
-        if retries > MAX_RETRIES:
-            src.rename(self.qdir / "failed" / new_name)
-            return "failed"
-        src.rename(self.qdir / "pending" / new_name)
-        return "requeued"
-
-
-class RemoteQueue:
-    """Same operations over ssh; the queue lives on the remote host."""
-
-    def __init__(self, cfg, host):
-        self.host = host
-        self.path = queue_cfg(cfg).get("remote_path", "~/HQ") + "/" + queue_cfg(cfg).get("dir", "queue")
-
-    def _ssh(self, command, check=True):
-        proc = subprocess.run(["ssh"] + SSH_OPTS + [self.host, command],
-                              capture_output=True, text=True)
-        if check and proc.returncode != 0:
-            fail(f"ssh {self.host} `{command}` failed: {proc.stderr.strip()[:300]}")
-        return proc
-
-    def list_pending(self):
-        proc = self._ssh(f"ls {self.path}/pending 2>/dev/null", check=False)
-        return sorted(n for n in proc.stdout.split() if n.endswith(".json"))
-
-    def claim(self, name):
-        proc = self._ssh(
-            f"mv {self.path}/pending/{shlex.quote(name)} {self.path}/processing/ "
-            f"&& cat {self.path}/processing/{shlex.quote(name)}"
-        )
-        return json.loads(proc.stdout)
-
-    def finish(self, name, ok):
-        if ok:
-            self._ssh(f"mv {self.path}/processing/{shlex.quote(name)} {self.path}/done/")
-            return "done"
-        parsed = parse_job_filename(name)
-        retries = parsed[2] + 1
-        new_name = name.rsplit(".r", 1)[0] + f".r{retries}.json"
-        dest = "failed" if retries > MAX_RETRIES else "pending"
-        self._ssh(f"mv {self.path}/processing/{shlex.quote(name)} {self.path}/{dest}/{shlex.quote(new_name)}")
-        return "failed" if dest == "failed" else "requeued"
+def run_job_llm(cfg, job_type, payload, log, job_name="job"):
+    # Fallback for any job type that is neither collect (hermes) nor triage
+    # (direct ollama) and that no plugin's handle_job() claimed. There is no
+    # generic agentic runner by design — such a job is a scheduling bug.
+    log.append({"cmd": f"run_job_llm({job_type}) — no runner for this type",
+                "exit": None, "tail": ""})
+    return False, f"no runner configured for job type {job_type!r}"
 
 
 def run_collect_job(cfg, issue, log, job_name, force=False):
@@ -382,8 +661,8 @@ def run_collect_job(cfg, issue, log, job_name, force=False):
     out_file.parent.mkdir(exist_ok=True)
     out_file.unlink(missing_ok=True)
 
-    ok, err = run_job_llm(cfg, "collect", {"issue": issue, "out_file": str(out_file)},
-                          log, job_name=job_name)
+    ok, err = run_hermes_collect(cfg, {"issue": issue, "out_file": str(out_file)},
+                                 log, job_name)
     if not ok:
         return False, err
     if not out_file.exists():
@@ -418,76 +697,77 @@ def _dispatch_to_plugin(job_type, cfg, payload, log, job_name):
 
 def cmd_work(args):
     cfg = load_config()
+    q = QueueClient(cfg)
+    worker = worker_name()
     types = [t.strip() for t in args.types.split(",")] if args.types else None
-    q = RemoteQueue(cfg, args.remote) if args.remote else LocalQueue(cfg)
+
+    stale_s = int(queue_cfg(cfg).get("stale_min", 60)) * 60
+    reclaimed = q.reclaim_stale(stale_s)
 
     processed = []
     log = []
-    for name in q.list_pending():
+    for job in q.list_pending():
         if len(processed) >= args.max:
             break
-        parsed = parse_job_filename(name)
-        if not parsed:
-            continue
-        job_type, target, _ = parsed
+        job_type = job["type"]
         if types and job_type not in types:
             continue
-        payload = q.claim(name)
+        if not q.claim(job, worker):
+            continue  # another worker won the race
+        target = job["target"]
+        payload = job.get("payload") or {}
+        job_name = f"{job_type}-{target}"
         if job_type == "collect":
             ok, err = run_collect_job(cfg, payload.get("issue") or int(target), log,
-                                      job_name=name, force=payload.get("force", False))
+                                      job_name=job_name, force=payload.get("force", False))
+        elif job_type == "triage":
+            ok, err = run_triage_job(cfg, payload, log, job_name)
         else:
-            result = _dispatch_to_plugin(job_type, cfg, payload, log, name)
+            result = _dispatch_to_plugin(job_type, cfg, payload, log, job_name)
             if result is not None:
                 ok, err = result
             else:
-                ok, err = run_job_llm(cfg, job_type, payload, log, job_name=name)
-        outcome = q.finish(name, ok)
-        processed.append({"job": name, "type": job_type, "target": target,
+                ok, err = run_job_llm(cfg, job_type, payload, log, job_name=job_name)
+        outcome = q.finish(job, worker, ok)
+        processed.append({"type": job_type, "target": target, "carrier": job["carrier"],
                           "outcome": outcome, **({"error": err} if err else {})})
 
-    print_json({"processed": processed, "log": log if args.verbose else []})
+    print_json({"worker": worker, "reclaimed": reclaimed, "processed": processed,
+                "log": log if args.verbose else []})
 
 
 def cmd_list(args):
     cfg = load_config()
-    qdir = queue_dir(cfg)
-    out = {}
-    for sub in ("pending", "processing", "done", "failed"):
-        names = sorted(f.name for f in (qdir / sub).glob("*.json"))
-        out[sub] = {"count": len(names), "jobs": names[-10:]}
-    out["state"] = load_state(cfg)
-    out["state"]["seen_message_ids"] = len(out["state"].get("seen_message_ids", []))
-    print_json(out)
+    q = QueueClient(cfg)
+    print_json(q.snapshot())
 
 
 def cmd_add(args):
     cfg = load_config()
-    qdir = queue_dir(cfg)
+    q = QueueClient(cfg)
     payload = {}
     target = args.target or args.type
     if args.issue:
         payload["issue"] = args.issue
         target = str(args.issue)
-    name = enqueue(qdir, args.type, target, payload)
-    print_json({"created": name})
+    ref = q.enqueue(args.type, target, payload)
+    print_json({"created": ref})
 
 
 def register(sub):
     p = sub.add_parser("queue", help="event detection + job queue (automation plumbing)")
     s2 = p.add_subparsers(dest="queue_cmd", required=True)
 
-    s = s2.add_parser("scan", help="detect new mail/issue activity and enqueue jobs (runs on the entry-point host)")
+    s = s2.add_parser("scan", help="detect new mail/issue activity and enqueue jobs as Forgejo labels (runs on the cron host)")
     s.set_defaults(func=cmd_scan)
 
-    s = s2.add_parser("work", help="process pending jobs with pi (per-type model config in queue.runners)")
-    s.add_argument("--types", help="comma-separated job types to handle (e.g. triage or collect,full-sweep)")
-    s.add_argument("--remote", help="claim jobs from this ssh host's queue instead of the local one")
-    s.add_argument("--max", type=int, default=5)
+    s = s2.add_parser("work", help="claim pending jobs (atomic label swap) and run them with the configured runner")
+    s.add_argument("--types", help="comma-separated job types to handle (e.g. triage or collect,thread_update)")
+    s.add_argument("--max", type=int, default=10)
     s.add_argument("--verbose", action="store_true")
     s.set_defaults(func=cmd_work)
 
-    s2.add_parser("list", help="queue contents and scan state").set_defaults(func=cmd_list)
+    s2.add_parser("list", help="live queue state (pending/claimed/failed) from Forgejo").set_defaults(func=cmd_list)
 
     s = s2.add_parser("add", help="manually enqueue a job (testing)")
     s.add_argument("type", choices=["triage", "collect"])
